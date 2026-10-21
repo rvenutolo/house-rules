@@ -19,22 +19,46 @@ readonly HOUSE_RULES_CONFIG='.house-rules.yml'
 # errors would read as success.
 readonly HOUSE_RULES_MAX_STATUS=255
 
+# The yq expressions below share two traps:
+# - yq-go evaluates a string literal even when its input stream is empty, so
+#   `[] | .[] | "x"` prints `x`. Every message therefore concatenates a value
+#   drawn from its input, and `top level` is substituted for an empty path with
+#   `sub` rather than written as a fallback literal.
+# - yq-go's string escapes are unreliable, so a single quote cannot be spelled
+#   inside a yq string. Each `'"'"'` ends the shell quote, adds a literal single
+#   quote and reopens it.
+
+# yq fragment turning a path array into a `where`: `section.key[index]`, or
+# `top level` for the root.
+readonly HOUSE_RULES_WHERE_EXPR='(map(select(tag == "!!int") |= "[" + tostring + "]") | join(".")
+  | sub("\.\[", "[") | sub("^$", "top level"))'
+
+# yq expression listing every merge key (`<<`) and every alias anywhere in the
+# file, one message each. Converting to JSON resolves both silently: an inline
+# merge can add an unknown key or override `step` unseen, so neither may reach
+# that conversion.
+# shellcheck disable=SC2016 # $p is a yq variable, not a shell one
+readonly HOUSE_RULES_MERGE_ALIAS_EXPR='
+([.. | select(type == "!!map") | {"path": path, "merges": [keys | .[] | select(tag == "!!merge")]}]
+  | map(.path as $p | .merges | map($p)) | flatten(1) | .[]
+  | '"${HOUSE_RULES_WHERE_EXPR}"'
+  | "merge key '"'"'<<'"'"' is not supported (in " + . + ")"),
+(.. | select(kind == "alias")
+  | "YAML alias '"'"'*" + alias + "'"'"' is not supported (in " + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")")
+'
+
 # yq expression listing every duplicate mapping key at the top level and inside
 # the section named by the HOUSE_RULES_LINT environment variable, one message
 # per key. yq-go keeps only the last of a duplicated key, so the duplicate is
-# invisible to every later read. The `where` part is `top level` for the root,
-# otherwise the path in `section.key[index]` form. Each `'"'"'` ends the shell
-# quote, adds a literal single quote and reopens it: yq-go's string escapes are
-# unreliable, so the quote cannot be spelled inside the yq string.
-# shellcheck disable=SC2016 # $where and $key are yq variables, not shell ones
+# invisible to every later read.
+# shellcheck disable=SC2016 # $where is a yq variable, not a shell one
 readonly HOUSE_RULES_DUPLICATE_KEYS_EXPR='
 (., (.[strenv(HOUSE_RULES_LINT)] | ..))
 | select(type == "!!map")
 | select((keys | length) > (keys | unique | length))
-| ([(path | map(select(tag == "!!int") |= "[" + tostring + "]") | join(".") | sub("\.\[", "[")
-    | select(. != "")), "top level"] | .[0]) as $where
-| (keys | group_by(.) | map(select(length > 1) | .[0]) | .[]) as $key
-| "duplicate key '"'"'" + ($key | tostring) + "'"'"' in " + $where
+| (path | '"${HOUSE_RULES_WHERE_EXPR}"') as $where
+| keys | group_by(.) | map(select(length > 1) | .[0]) | .[]
+| "duplicate key '"'"'" + tostring + "'"'"' in " + $where
 '
 
 # @description Print `<script-name>: <message>` to stderr and exit 1. Inside a
@@ -72,15 +96,40 @@ function house_rules::repo_root() {
   printf '%s\n' "${root}"
 }
 
+# @description Run yq with its stdout in out_file and its stderr in err_file,
+#              so no yq warning reaches the lint's output. Dies with yq's
+#              stderr when yq fails.
+# @arg $1 out_file where to write yq's stdout
+# @arg $2 err_file where to write yq's stderr
+# @arg $@ args yq's arguments, after the first two
+function house_rules::yq() {
+  local -r out_file="$1"
+  local -r err_file="$2"
+  shift 2
+  if ! yq "$@" > "${out_file}" 2> "${err_file}"; then
+    house_rules::die "yq failed: $(< "${err_file}")"
+  fi
+}
+
+# @description Fail loudly when a file a loop is about to read is missing.
+#              Errexit is off in the validators, so a missing file would
+#              otherwise read as zero errors.
+# @arg $1 file the file that must exist
+function house_rules::require_file() {
+  local -r file="$1"
+  [[ -f "${file}" ]] || house_rules::die "missing ${file}"
+}
+
 # @description Validate the file level of `<repo_root>/.house-rules.yml` and
 #              write the lint's section to out_file as JSON. File level means:
-#              it parses, holds one document, its top level is a map, every
-#              top-level key is a known lint, and no map at the top level or in
-#              the lint's section repeats a key. The section's own schema is the
-#              lint's to check. out_file gets `null` when there is no file, the
-#              file is empty, or the section is missing or empty, and also when
-#              the file is too broken to read a section from. out_file doubles
-#              as scratch space while validating.
+#              it parses, holds one document, uses no merge key or alias, its
+#              top level is a map, every top-level key is a known lint, and no
+#              map at the top level or in the lint's section repeats a key. The
+#              section's own schema is the lint's to check. out_file gets
+#              `null` when there is no file, the file is empty, or the section
+#              is missing or empty, and also when the file is too broken to
+#              read a section from. out_file and `<out_file>.stderr` double as
+#              scratch space while validating.
 # @arg $1 lint the lint whose section to extract
 # @arg $2 repo_root absolute path of the repo root
 # @arg $3 out_file where to write the section as JSON
@@ -91,6 +140,7 @@ function house_rules::load_config() {
   local -r lint="$1"
   local -r repo_root="$2"
   local -r out_file="$3"
+  local -r err_file="${out_file}.stderr"
   local -r config_file="${repo_root}/${HOUSE_RULES_CONFIG}"
 
   # A dangling symlink is not "no file": it goes on to yq, which reports it.
@@ -101,21 +151,40 @@ function house_rules::load_config() {
 
   # Counting documents parses every one of them, so this is the parse check too.
   local doc_count
-  if ! doc_count="$(yq eval-all '[.] | length' "${config_file}" 2> "${out_file}")"; then
+  if ! yq eval-all '[.] | length' "${config_file}" > "${out_file}" 2> "${err_file}"; then
     local yq_error
-    yq_error="$(< "${out_file}")" || house_rules::die "cannot read ${out_file}"
+    yq_error="$(< "${err_file}")" || house_rules::die "cannot read ${err_file}"
     house_rules::config_error "not valid YAML: ${yq_error}"
     printf 'null\n' > "${out_file}" || house_rules::die "cannot write ${out_file}"
     return 1
   fi
+  doc_count="$(< "${out_file}")" || house_rules::die "cannot read ${out_file}"
   if [[ "${doc_count}" != '1' ]]; then
     house_rules::config_error "holds ${doc_count} YAML documents; expected one"
     printf 'null\n' > "${out_file}" || house_rules::die "cannot write ${out_file}"
     return 1
   fi
 
+  local errors=0
+  local line
+
+  # Checked before anything else reads the file, and fatal: every later read
+  # would see the merged or aliased content instead of what was written.
+  house_rules::yq "${out_file}" "${err_file}" "${HOUSE_RULES_MERGE_ALIAS_EXPR}" "${config_file}"
+  house_rules::require_file "${out_file}"
+  while IFS= read -r line; do
+    house_rules::config_error "${line}"
+    errors=$((errors + 1))
+  done < "${out_file}"
+  if ((errors > 0)); then
+    printf 'null\n' > "${out_file}" || house_rules::die "cannot write ${out_file}"
+    house_rules::return_count "${errors}"
+    return
+  fi
+
   local top_type
-  top_type="$(yq 'type' "${config_file}")" || house_rules::die "yq failed reading ${config_file}"
+  house_rules::yq "${out_file}" "${err_file}" 'type' "${config_file}"
+  top_type="$(< "${out_file}")" || house_rules::die "cannot read ${out_file}"
   case "${top_type}" in
     '!!map') ;;
     '!!null')
@@ -129,11 +198,9 @@ function house_rules::load_config() {
       ;;
   esac
 
-  local errors=0
-  local line
-
-  HOUSE_RULES_LINT="${lint}" yq "${HOUSE_RULES_DUPLICATE_KEYS_EXPR}" "${config_file}" > "${out_file}" \
-    || house_rules::die "yq failed reading ${config_file}"
+  HOUSE_RULES_LINT="${lint}" house_rules::yq "${out_file}" "${err_file}" \
+    "${HOUSE_RULES_DUPLICATE_KEYS_EXPR}" "${config_file}"
+  house_rules::require_file "${out_file}"
   while IFS= read -r line; do
     house_rules::config_error "${line}"
     errors=$((errors + 1))
@@ -141,7 +208,8 @@ function house_rules::load_config() {
 
   # `unique` so a duplicated unknown key is reported once here; the duplicate
   # itself is reported above.
-  yq 'keys | unique | .[]' "${config_file}" > "${out_file}" || house_rules::die "yq failed reading ${config_file}"
+  house_rules::yq "${out_file}" "${err_file}" 'keys | unique | .[]' "${config_file}"
+  house_rules::require_file "${out_file}"
   local known known_list
   printf -v known_list '%s, ' "${HOUSE_RULES_LINTS[@]}"
   known_list="${known_list%, }"
@@ -155,9 +223,18 @@ function house_rules::load_config() {
     errors=$((errors + 1))
   done < "${out_file}"
 
-  HOUSE_RULES_LINT="${lint}" yq --output-format=json '.[strenv(HOUSE_RULES_LINT)]' "${config_file}" > "${out_file}" \
-    || house_rules::die "yq failed reading ${config_file}"
+  HOUSE_RULES_LINT="${lint}" house_rules::yq "${out_file}" "${err_file}" \
+    --output-format=json '.[strenv(HOUSE_RULES_LINT)]' "${config_file}"
 
+  house_rules::return_count "${errors}"
+}
+
+# @description Return an error count as an exit status, capped at 255 so that
+#              256 errors cannot wrap to success.
+# @arg $1 errors the error count
+# @exitcode * the capped count
+function house_rules::return_count() {
+  local -r errors="$1"
   if ((errors > HOUSE_RULES_MAX_STATUS)); then
     return "${HOUSE_RULES_MAX_STATUS}"
   fi

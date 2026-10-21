@@ -49,20 +49,9 @@ function section_error() {
   house_rules::config_error "${LINT}: ${problem}"
 }
 
-# @description Cap an error count at the largest exit status, so a count of
-#              256 cannot wrap to success.
-# @arg $1 errors the error count
-# @exitcode * the capped count
-function return_count() {
-  local -r errors="$1"
-  if ((errors > HOUSE_RULES_MAX_STATUS)); then
-    return "${HOUSE_RULES_MAX_STATUS}"
-  fi
-  return "${errors}"
-}
-
 # @description Evaluate a yq expression over the section JSON file and store
-#              the result, as a raw scalar or YAML, in the named variable.
+#              the result, as a raw scalar or YAML, in the named variable. The
+#              value is kept exactly, trailing newlines included.
 # @arg $1 result_var name of the variable to set
 # @arg $2 json_file the section JSON
 # @arg $3 expr the yq expression
@@ -70,10 +59,14 @@ function json_query() {
   local -n result_ref="$1"
   local -r json_file="$2"
   local -r expr="$3"
-  yq --input-format=json --output-format=yaml "${expr}" "${json_file}" > "${QUERY_FILE}" \
-    || house_rules::die "yq failed reading ${json_file}"
-  # shellcheck disable=SC2034 # set through the nameref; the caller reads it
-  result_ref="$(< "${QUERY_FILE}")" || house_rules::die "cannot read ${QUERY_FILE}"
+  house_rules::yq "${QUERY_FILE}" "${YQ_ERR_FILE}" --input-format=json --output-format=yaml "${expr}" "${json_file}"
+  house_rules::require_file "${QUERY_FILE}"
+  # Not `$(< file)`, which strips every trailing newline and would let
+  # `step: "a.yml::x\n"` through. read -d '' always reports end of input as
+  # status 1, so that status says nothing.
+  IFS= read -r -d '' result_ref < "${QUERY_FILE}" || true
+  # yq ends its output with exactly one newline of its own.
+  result_ref="${result_ref%$'\n'}"
 }
 
 # @description Write the unique keys of the map a yq expression selects, one
@@ -85,8 +78,8 @@ function json_keys() {
   local -r json_file="$1"
   local -r expr="$2"
   local -r out_file="$3"
-  yq --input-format=json --output-format=yaml "${expr} | keys | unique | .[]" "${json_file}" > "${out_file}" \
-    || house_rules::die "yq failed reading ${json_file}"
+  house_rules::yq "${out_file}" "${YQ_ERR_FILE}" --input-format=json --output-format=yaml \
+    "${expr} | keys | unique | .[]" "${json_file}"
 }
 
 # @description Report every key of a map that is not in the allowed list.
@@ -99,6 +92,7 @@ function report_unknown_keys() {
   local -r keys_file="$1"
   local -r prefix="$2"
   shift 2
+  house_rules::require_file "${keys_file}"
   local errors=0 key allowed_key
   while IFS= read -r key; do
     for allowed_key in "$@"; do
@@ -109,7 +103,7 @@ function report_unknown_keys() {
     section_error "${prefix}unknown key '${key}'"
     errors=$((errors + 1))
   done < "${keys_file}"
-  return_count "${errors}"
+  house_rules::return_count "${errors}"
 }
 
 # @description Validate one `exempt` entry and write its step to out_step_file
@@ -151,15 +145,16 @@ function validate_entry() {
     '!!str')
       json_query step "${section_file}" "${entry}.step"
       # Exactly one `::`: splitting at the first and at the last occurrence
-      # must agree, which also rejects an overlapping `:::`. A newline would
-      # split the one-step-per-line exempt file.
+      # must agree, which also rejects an overlapping `:::`. Neither part may
+      # be blank. A newline would split the one-step-per-line exempt file.
       local -r file_part="${step%%::*}"
       local -r id_part="${step#*::}"
-      if [[ "${step}" == *::* && "${file_part}" == "${step%::*}" && -n "${file_part}" && -n "${id_part}" &&
-        "${step}" != *$'\n'* ]]; then
+      if [[ "${step}" == *::* && "${file_part}" == "${step%::*}" && -n "${file_part//[[:space:]]/}" &&
+        -n "${id_part//[[:space:]]/}" && "${step}" != *$'\n'* ]]; then
         step_ok=1
       else
-        section_error "${where}: step '${step}' is not <file>::<id>"
+        # Newlines shown as `\n` so the message stays on one line.
+        section_error "${where}: step '${step//$'\n'/\\n}' is not <file>::<id>"
         errors=$((errors + 1))
       fi
       ;;
@@ -192,7 +187,7 @@ function validate_entry() {
   if ((step_ok == 1)); then
     printf '%s\n' "${step}" > "${out_step_file}" || house_rules::die "cannot write ${out_step_file}"
   fi
-  return_count "${errors}"
+  house_rules::return_count "${errors}"
 }
 
 # @description Validate this lint's section of `.house-rules.yml`, as written
@@ -241,6 +236,10 @@ function validate_section() {
       if [[ -z "${wrapper_value//[[:space:]]/}" ]]; then
         section_error 'wrapper must not be empty'
         errors=$((errors + 1))
+      elif [[ "${wrapper_value}" == *$'\n'* ]]; then
+        # TODO: the spec pins no message for a multi-line wrapper; confirm this one.
+        section_error 'wrapper must be a single line'
+        errors=$((errors + 1))
       else
         # shellcheck disable=SC2034 # set through the nameref; the caller reads it
         wrapper_ref="${wrapper_value}"
@@ -284,7 +283,7 @@ function validate_section() {
     fi
   fi
 
-  return_count "${errors}"
+  house_rules::return_count "${errors}"
 }
 
 # @description Validate the config, then run the lint.
@@ -336,5 +335,6 @@ TMP_DIR="$(mktemp --directory)"
 readonly TMP_DIR
 trap 'rm --recursive --force -- "${TMP_DIR}"' EXIT
 readonly QUERY_FILE="${TMP_DIR}/query"
+readonly YQ_ERR_FILE="${TMP_DIR}/yq-stderr"
 
 main "$@"
