@@ -50,6 +50,7 @@ runs:
       shell: bash
       run: |
         set -Eeuo pipefail
+        IFS=$'\n\t'
         nix build '.#devShells.x86_64-linux.default.inputDerivation' --out-link "${RUNNER_TEMP}/gcroots/devshell"
         nix build --inputs-from . 'nixpkgs#bashInteractive' --out-link "${RUNNER_TEMP}/gcroots/bash-interactive"
         nix print-dev-env --profile "${RUNNER_TEMP}/gcroots/shell-env" > /dev/null
