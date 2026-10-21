@@ -580,6 +580,139 @@ EOF
 EOF
 }
 
+@test 'fails: newline in a top-level key' {
+  write_config << 'EOF'
+"check-workflow-hermetic\ncheck-workflow-hermetic": 1
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: unknown lint 'check-workflow-hermetic\ncheck-workflow-hermetic'; known: check-workflow-hermetic
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: newline in a section key' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  "wrapper\nexempt": {bogus: 1}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: check-workflow-hermetic: unknown key 'wrapper\nexempt'
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: newline in an entry key' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - {step: a.yml::x, reason: r, "step\nstep": [1, 2, 3]}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: check-workflow-hermetic: exempt[0]: unknown key 'step\nstep'
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: carriage return in a key is printed escaped' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  "wrapper\rexempt": 1
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  refute_regex "${stderr}" $'\r'
+  assert_stderr - << 'EOF'
+.house-rules.yml: check-workflow-hermetic: unknown key 'wrapper\rexempt'
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: custom tag on the wrapper key' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  !custom wrapper: .ci/x
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: YAML tag '!custom' is not supported (in check-workflow-hermetic)
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: custom tag on the wrapper value' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  wrapper: !custom .ci/x
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: YAML tag '!custom' is not supported (in check-workflow-hermetic.wrapper)
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: custom tag on a step' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: !foo a.yml::x
+      reason: Runs before Nix is installed.
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt[0].step)
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: custom tag on an entry' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - !foo {step: a.yml::x, reason: r}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt[0])
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: custom tag on the exempt list' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt: !foo
+    - {step: a.yml::x, reason: r}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt)
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: !!str tagged int step is read as a string' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: !!str 5
+      reason: Runs before Nix is installed.
+EOF
+  run check-workflow-hermetic
+  assert_config_error "check-workflow-hermetic: exempt[0]: step '5' is not <file>::<id>"
+}
+
 @test 'reports every config error in one run' {
   write_config << 'EOF'
 check-workflow-hermetic:
