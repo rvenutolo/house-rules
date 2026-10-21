@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+bats_require_minimum_version 1.5.0
+
 function setup() {
   load test_helper/common
   make_repo
@@ -28,13 +30,15 @@ EOF
 }
 
 # @description Assert the run failed with exit 1 on the given config error and
-#              ended with the error count.
+#              reported the given total error count.
 # @arg $1 message the message after the `.house-rules.yml: ` prefix
+# @arg $2 count the expected total error count; defaults to 1
 function assert_config_error() {
   local -r message="$1"
+  local -r count="${2:-1}"
   assert_failure 1
   assert_output --partial ".house-rules.yml: ${message}"
-  assert_output --partial 'error(s)'
+  assert_line "${count} .house-rules.yml error(s)"
 }
 
 @test 'passes: no .house-rules.yml and no workflows' {
@@ -349,6 +353,192 @@ EOF
   assert_config_error "check-workflow-hermetic: exempt[1]: duplicate step '.github/workflows/ci.yml::bare'"
 }
 
+@test 'passes: exempt is an empty list' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt: []
+EOF
+  run check-workflow-hermetic
+  assert_success
+}
+
+@test 'fails: whitespace-only wrapper' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  wrapper: '   '
+EOF
+  run check-workflow-hermetic
+  assert_config_error 'check-workflow-hermetic: wrapper must not be empty'
+}
+
+@test 'fails: wrapper with a trailing newline' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  wrapper: ".ci/in-devshell\n"
+EOF
+  run check-workflow-hermetic
+  assert_config_error 'check-workflow-hermetic: wrapper must be a single line'
+}
+
+@test 'fails: step with a trailing newline' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: "a.yml::x\n"
+      reason: Runs before Nix is installed.
+EOF
+  run check-workflow-hermetic
+  assert_config_error "check-workflow-hermetic: exempt[0]: step 'a.yml::x\n' is not <file>::<id>"
+}
+
+@test 'fails: step as a literal block scalar' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: |
+        a.yml::x
+      reason: Runs before Nix is installed.
+EOF
+  run check-workflow-hermetic
+  assert_config_error "check-workflow-hermetic: exempt[0]: step 'a.yml::x\n' is not <file>::<id>"
+}
+
+@test 'fails: malformed step (blank file part)' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: ' ::x'
+      reason: Runs before Nix is installed.
+EOF
+  run check-workflow-hermetic
+  assert_config_error "check-workflow-hermetic: exempt[0]: step ' ::x' is not <file>::<id>"
+}
+
+@test 'fails: malformed step (blank id part)' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: 'a.yml:: '
+      reason: Runs before Nix is installed.
+EOF
+  run check-workflow-hermetic
+  assert_config_error "check-workflow-hermetic: exempt[0]: step 'a.yml:: ' is not <file>::<id>"
+}
+
+@test 'passes: a folded multi-line reason' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: a.yml::x
+      reason: >-
+        Runs before Nix is installed. It decides whether the Nix jobs run at
+        all, so it cannot depend on them.
+EOF
+  run check-workflow-hermetic
+  assert_success
+}
+
+@test 'fails: merge key adds an unknown key to an entry' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - {step: a.yml::x, reason: r, <<: {bogus: 1}}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_output ''
+  assert_stderr - << 'EOF'
+.house-rules.yml: merge key '<<' is not supported (in check-workflow-hermetic.exempt[0])
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: merge key adds an unknown key to the section' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  <<: {bogus: 1}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: merge key '<<' is not supported (in check-workflow-hermetic)
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: merge key overrides an entry step' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - {step: a.yml::x, reason: r, <<: {step: b.yml::y}}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: merge key '<<' is not supported (in check-workflow-hermetic.exempt[0])
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: entry made only of a merge key' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - <<: {step: a.yml::x, reason: r}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: merge key '<<' is not supported (in check-workflow-hermetic.exempt[0])
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: YAML alias' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - &entry {step: a.yml::x, reason: r}
+    - *entry
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: YAML alias '*entry' is not supported (in check-workflow-hermetic.exempt[1])
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: merge key with an alias reports both' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - &base {step: a.yml::x, reason: r}
+    - {<<: *base, step: b.yml::y}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: merge key '<<' is not supported (in check-workflow-hermetic.exempt[1])
+.house-rules.yml: YAML alias '*base' is not supported (in check-workflow-hermetic.exempt[1].<<)
+2 .house-rules.yml error(s)
+EOF
+}
+
+@test 'reports only its own lines on stderr for a section error' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt: {}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_output ''
+  assert_stderr - << 'EOF'
+.house-rules.yml: check-workflow-hermetic: exempt must be a list
+1 .house-rules.yml error(s)
+EOF
+}
+
 @test 'reports every config error in one run' {
   write_config << 'EOF'
 check-workflow-hermetic:
@@ -361,7 +551,7 @@ EOF
   assert_failure 1
   assert_output --partial ".house-rules.yml: check-workflow-hermetic: exempt[0]: step 'a.yml' is not <file>::<id>"
   assert_output --partial '.house-rules.yml: check-workflow-hermetic: exempt[1]: reason is missing or empty'
-  assert_output --partial '2 .house-rules.yml error(s)'
+  assert_line '2 .house-rules.yml error(s)'
 }
 
 @test 'fails: outside a git repository' {
