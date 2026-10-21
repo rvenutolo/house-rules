@@ -2,7 +2,8 @@
 
 # @description Git pre-push hook: runs the full gate inside the devShell and
 #              aborts the push if it fails. Bypass with `git push --no-verify`.
-# @noargs
+# @arg $1 remote name of the remote being pushed to, supplied by git
+# @arg $2 url URL of the remote being pushed to, supplied by git
 # @exitcode 0 the gate passed.
 # @exitcode 1 the gate failed.
 
@@ -11,6 +12,9 @@ IFS=$'\n\t'
 
 trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
 
+# @description Run the full gate inside the devShell; abort the push on failure.
+# @arg $1 remote name of the remote being pushed to, supplied by git
+# @arg $2 url URL of the remote being pushed to, supplied by git
 function main() {
   local repo_dir
   repo_dir="$(git rev-parse --show-toplevel)"

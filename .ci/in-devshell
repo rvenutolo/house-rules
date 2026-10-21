@@ -22,7 +22,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-trap 'printf "\033[0;31m[%s] ERROR: line %s (exit %s): %s\033[0m\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
 
 # This script runs under the HOST bash, before the devShell it creates exists,
 # so the host's version is whatever the machine ships. `shopt -s
@@ -67,29 +67,13 @@ readonly KEEP_VARS=(
 )
 
 # @description Run the given command inside the devShell of the enclosing repo.
-# @arg $@ command the command to run, plus its arguments
+# @arg $@ command the command to run, plus its arguments (already validated)
 function main() {
-  if (($# == 0)); then
-    printf 'usage: %s <command> [args...]\n' "${0##*/}" >&2
-    exit 1
-  fi
-
-  # Already inside the boundary: run directly, skip a second nix evaluation.
-  if [[ -n "${IN_DEVSHELL:-}" ]]; then
-    exec "$@"
-  fi
-
-  local repo_dir
-  if ! repo_dir="$(git rev-parse --show-toplevel 2> '/dev/null')"; then
-    printf '%s: not a git repo: %s\n' "${0##*/}" "$(pwd)" >&2
-    exit 1
-  fi
-
   export IN_DEVSHELL=1
 
   # The flake reference is the repo the command was invoked in, never a
   # relative path: a gate must evaluate the tree it is grading.
-  local -a nix_args=(develop "${repo_dir}" --ignore-environment)
+  local -a nix_args=(develop "${REPO_DIR}" --ignore-environment)
   local keep_var
   for keep_var in "${KEEP_VARS[@]}"; do
     nix_args+=(--keep "${keep_var}")
@@ -98,5 +82,21 @@ function main() {
 
   exec nix "${nix_args[@]}" "$@"
 }
+
+if (($# == 0)); then
+  printf 'usage: %s <command> [args...]\n' "${0##*/}" >&2
+  exit 1
+fi
+
+# Already inside the boundary: run directly, skip a second nix evaluation.
+if [[ -n "${IN_DEVSHELL:-}" ]]; then
+  exec "$@"
+fi
+
+if ! REPO_DIR="$(git rev-parse --show-toplevel 2> '/dev/null')"; then
+  printf '%s: not a git repo: %s\n' "${0##*/}" "$(pwd)" >&2
+  exit 1
+fi
+readonly REPO_DIR
 
 main "$@"

@@ -13,13 +13,16 @@ IFS=$'\n\t'
 
 trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
 
+# @description Validate the commit message with commitlint.
+# @arg $1 message_file path to the commit message file
 function main() {
   local -r message_file="$1"
-  if ! command -v commitlint > '/dev/null' 2>&1; then
-    printf 'commit-msg: commitlint not found on PATH; enter the devShell (nix develop)\n' >&2
-    exit 1
-  fi
   commitlint --edit "${message_file}"
 }
+
+if ! command -v commitlint > '/dev/null' 2>&1; then
+  printf 'commit-msg: commitlint not found on PATH; enter the devShell (nix develop)\n' >&2
+  exit 1
+fi
 
 main "$@"

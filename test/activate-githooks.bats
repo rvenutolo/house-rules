@@ -23,4 +23,21 @@ function setup() {
 @test 'exits 1 when given an argument' {
   run "${REPO_DIR}/.ci/activate-githooks" unexpected
   assert_failure 1
+  assert_output --partial 'expected no arguments, got 1'
+}
+
+@test 'fails outside a git repository' {
+  cd "${BATS_TEST_TMPDIR}"
+  run "${REPO_DIR}/.ci/activate-githooks"
+  assert_failure 1
+  assert_output --partial 'not a git repo'
+}
+
+@test 'repoints a foreign core.hooksPath' {
+  git config --local core.hooksPath 'other-hooks'
+  run "${REPO_DIR}/.ci/activate-githooks"
+  assert_success
+  assert_output --partial 'repointed core.hooksPath from other-hooks to .githooks'
+  run git config --local --get core.hooksPath
+  assert_output '.githooks'
 }

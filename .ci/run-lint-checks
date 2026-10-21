@@ -33,22 +33,37 @@ TMP_FILE="$(mktemp)"
 readonly TMP_FILE
 trap 'rm --force -- "${TMP_FILE}"' EXIT
 
-# @description Print a progress line to stderr.
-# @arg $1 message text to print
+# @description Write a timestamped, levelled line to stderr.
+# @arg $1 level severity label
+# @arg $2 message text to print
 function log() {
-  local -r message="$1"
-  printf '[%s] %s\n' "${0##*/}" "${message}" >&2
+  local -r level="$1"
+  local -r message="$2"
+  printf '[%s] %-5s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${level}" "${message}" >&2
+}
+
+# @description Write an INFO line to stderr.
+# @arg $@ message text to print
+function log_info() {
+  log INFO "$*"
+}
+
+# @description Write an ERROR line to stderr.
+# @arg $@ message text to print
+function log_err() {
+  log ERROR "$*"
 }
 
 # @description Load the tracked files matching the pathspecs into an array.
+#              The listing is NUL-separated so unusual file names survive.
 # @arg $1 array_name name of the array to fill
 # @arg $@ pathspecs git pathspecs to list
 function load_tracked() {
   local -n files_ref="$1"
   shift
-  git ls-files -- "$@" > "${TMP_FILE}"
+  git ls-files -z -- "$@" > "${TMP_FILE}"
   # shellcheck disable=SC2034 # filled through the nameref; the caller reads it
-  mapfile -t files_ref < "${TMP_FILE}"
+  mapfile -d '' -t files_ref < "${TMP_FILE}"
 }
 
 # @description Load the tracked shell scripts into an array: every `*.bash` and
@@ -58,9 +73,9 @@ function load_tracked() {
 function load_shell_files() {
   local -n shell_files_ref="$1"
   shell_files_ref=()
-  git ls-files --stage > "${TMP_FILE}"
+  git ls-files --stage -z > "${TMP_FILE}"
   local mode path name in_scope
-  while IFS=$' \t' read -r mode _ _ path; do
+  while IFS=$' \t' read -r -d '' mode _ _ path; do
     name="${path##*/}"
     case "${name}" in
       *.bash | *.bats)
@@ -89,7 +104,7 @@ function require_files() {
   local -r label="$1"
   local -r count="$2"
   if ((count == 0)); then
-    log "no ${label} found; this is a failure, not a clean pass"
+    log_err "no ${label} found; this is a failure, not a clean pass"
     return 1
   fi
 }
@@ -97,15 +112,11 @@ function require_files() {
 # @description Run every linter and aggregate the exit codes.
 # @noargs
 function main() {
-  local repo_dir
-  repo_dir="$(git rev-parse --show-toplevel)"
-  cd "${repo_dir}"
-
   local rc=0
-  local -a shell_files=() bats_files=() other_shell_files=() nix_files=() workflow_files=()
-  local -a yaml_files=() md_files=() text_files=()
+  local -a shell_files=() bats_files=() other_shell_files=() nix_files=() workflow_files=() github_files=()
+  local -a justfiles=() yaml_files=() md_files=() text_files=()
 
-  log 'running shellcheck'
+  log_info 'running shellcheck'
   load_shell_files shell_files
   if require_files 'shell files' "${#shell_files[@]}"; then
     # LC_ALL: the hermetic shell sets no locale, and shellcheck then dies on
@@ -115,7 +126,7 @@ function main() {
     rc=1
   fi
 
-  log 'running shfmt (verify only)'
+  log_info 'running shfmt (verify only)'
   local shell_file
   for shell_file in "${shell_files[@]}"; do
     case "${shell_file}" in
@@ -123,20 +134,29 @@ function main() {
       *) other_shell_files+=("${shell_file}") ;;
     esac
   done
-  if ((${#other_shell_files[@]} > 0)); then
+  if require_files 'non-bats shell files' "${#other_shell_files[@]}"; then
     shfmt --list --diff --indent 2 --case-indent --binary-next-line --space-redirects \
       "${other_shell_files[@]}" || rc=1
+  else
+    rc=1
   fi
-  if ((${#bats_files[@]} > 0)); then
+  if require_files 'bats files' "${#bats_files[@]}"; then
     shfmt --list --diff --indent 2 --case-indent --binary-next-line --space-redirects \
       --language-dialect bats "${bats_files[@]}" || rc=1
+  else
+    rc=1
   fi
 
-  log 'running just --fmt (verify only)'
-  # --unstable: `--fmt` is still an unstable subcommand.
-  just --fmt --check --unstable --justfile "${repo_dir}/.justfile" || rc=1
+  log_info 'running just --fmt (verify only)'
+  load_tracked justfiles '.justfile'
+  if require_files 'justfile' "${#justfiles[@]}"; then
+    # --unstable: `--fmt` is still an unstable subcommand.
+    just --fmt --check --unstable --justfile "${justfiles[0]}" || rc=1
+  else
+    rc=1
+  fi
 
-  log 'running statix and deadnix'
+  log_info 'running statix and deadnix'
   load_tracked nix_files '*.nix'
   if require_files 'nix files' "${#nix_files[@]}"; then
     local nix_file
@@ -148,7 +168,7 @@ function main() {
     rc=1
   fi
 
-  log 'running actionlint'
+  log_info 'running actionlint'
   load_tracked workflow_files '.github/workflows/*.yml' '.github/workflows/*.yaml'
   if require_files 'workflow files' "${#workflow_files[@]}"; then
     actionlint "${workflow_files[@]}" || rc=1
@@ -156,11 +176,16 @@ function main() {
     rc=1
   fi
 
-  log 'running zizmor'
-  # --no-online-audits: the gate needs no network for this.
-  zizmor --no-online-audits .github/ || rc=1
+  log_info 'running zizmor'
+  load_tracked github_files '.github/*'
+  if require_files 'files under .github/' "${#github_files[@]}"; then
+    # --no-online-audits: the gate needs no network for this.
+    zizmor --no-online-audits .github/ || rc=1
+  else
+    rc=1
+  fi
 
-  log 'running yamllint'
+  log_info 'running yamllint'
   load_tracked yaml_files '*.yml' '*.yaml'
   if require_files 'yaml files' "${#yaml_files[@]}"; then
     yamllint --strict "${yaml_files[@]}" || rc=1
@@ -168,7 +193,7 @@ function main() {
     rc=1
   fi
 
-  log 'running markdownlint'
+  log_info 'running markdownlint'
   load_tracked md_files '*.md'
   if require_files 'markdown files' "${#md_files[@]}"; then
     markdownlint-cli2 "${md_files[@]}" || rc=1
@@ -176,11 +201,15 @@ function main() {
     rc=1
   fi
 
-  log 'running typos'
+  log_info 'running typos'
   # Every tracked text file. A bare `typos` skips hidden paths (.ci, .github)
-  # and walks untracked ones.
-  git grep -I --files-with-matches '' > "${TMP_FILE}" || true # exit 1 means no text files; caught below
-  mapfile -t text_files < "${TMP_FILE}"
+  # and walks untracked ones. A git failure, including "no text files" (exit
+  # 1), marks the run failed instead of being swallowed.
+  if git grep -I -z --files-with-matches '' > "${TMP_FILE}"; then
+    mapfile -d '' -t text_files < "${TMP_FILE}"
+  else
+    rc=1
+  fi
   if require_files 'text files' "${#text_files[@]}"; then
     typos "${text_files[@]}" || rc=1
   else
@@ -188,12 +217,16 @@ function main() {
   fi
 
   if ((rc != 0)); then
-    log 'one or more linters failed'
+    log_err 'one or more linters failed'
   fi
   # A gate reporting its own verdict is not a crash: drop the ERR trap so the
   # diagnostics above are the last thing the reader sees.
   trap - ERR
   return "${rc}"
 }
+
+REPO_DIR="$(git rev-parse --show-toplevel)"
+readonly REPO_DIR
+cd "${REPO_DIR}" || exit 1
 
 main "$@"
