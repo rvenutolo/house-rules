@@ -2,7 +2,7 @@
   lib,
   stdenvNoCC,
   makeWrapper,
-  bash,
+  bashNonInteractive,
   yq-go,
   git,
   findutils,
@@ -12,7 +12,6 @@
 
 stdenvNoCC.mkDerivation {
   pname = "check-workflow-hermetic";
-  # TODO: derive this from the versioning scheme once consumers pin releases.
   version = "0.1.0";
 
   src = lib.fileset.toSource {
@@ -25,7 +24,8 @@ stdenvNoCC.mkDerivation {
 
   nativeBuildInputs = [ makeWrapper ];
   # In buildInputs so patchShebangs resolves `#!/usr/bin/env bash` to this bash.
-  buildInputs = [ bash ];
+  # The non-interactive build keeps readline and ncurses out of the closure.
+  buildInputs = [ bashNonInteractive ];
 
   dontConfigure = true;
   dontBuild = true;
