@@ -93,7 +93,7 @@ readonly DIRECT_SCALARS_EXPR='[.. | select(kind == "scalar") | tostring
 # `jobs` or `run` would hide the first value from every later read.
 # shellcheck disable=SC2016 # $where is a yq variable, not a shell one
 readonly WORKFLOW_DUPLICATE_KEYS_EXPR='
-.. | select(type == "!!map")
+.. | select(kind == "map")
 | select((keys | length) > (keys | unique | length))
 | (path | '"${HOUSE_RULES_WHERE_EXPR}"') as $where
 | keys | group_by(.) | map(select(length > 1) | .[0]) | .[]
@@ -102,7 +102,9 @@ readonly WORKFLOW_DUPLICATE_KEYS_EXPR='
 
 # yq expression emitting one record per step that carries a `run:` key, for
 # both the workflow (`.jobs[].steps[]`) and composite-action (`.runs.steps[]`)
-# shapes. The record is built by concatenation, not `[...] | join`: on an empty
+# shapes. Structural guards test `kind`, not `type`: `type` is the node's tag,
+# so a tagged map or list would read as neither and its steps would vanish.
+# The record is built by concatenation, not `[...] | join`: on an empty
 # stream yq still builds the array and prints an empty line. explode(.)
 # resolves aliases and merge keys first, so a step, steps list or run body
 # reached through one is still seen; the caller runs yq with merge keys
@@ -115,16 +117,16 @@ readonly WORKFLOW_DUPLICATE_KEYS_EXPR='
 # string: a NUL in the body cannot vanish the way it would in bash.
 # shellcheck disable=SC2016 # $job is a yq variable, not a shell one
 readonly EXTRACT_RUN_STEPS_EXPR='
-explode(.) | select(type == "!!map")
+explode(.) | select(kind == "map")
 | [
-    (.jobs | select(type == "!!map" or type == "!!seq") | to_entries | .[] | .key as $job
-      | .value | select(type == "!!map") | .steps | select(type == "!!seq" or type == "!!map")
+    (.jobs | select(kind == "map" or kind == "seq") | to_entries | .[] | .key as $job
+      | .value | select(kind == "map") | .steps | select(kind == "seq" or kind == "map")
       | to_entries | .[] | {"j": ($job | tostring), "i": (.key | tostring), "v": .value}),
-    (.runs | select(type == "!!map") | .steps | select(type == "!!seq" or type == "!!map")
+    (.runs | select(kind == "map") | .steps | select(kind == "seq" or kind == "map")
       | to_entries | .[] | {"j": "runs", "i": (.key | tostring), "v": .value})
   ]
 | .[]
-| select(.v | type == "!!map")
+| select(.v | kind == "map")
 | select(.v | has("run"))
 | ((.v.id // "") | tostring) as $id
 | (.j | @base64)
@@ -572,6 +574,16 @@ function scan_file() {
   local line
   while IFS= read -r line; do
     printf '%s: not valid YAML: %s\n' "${shown_rel}" "${line}" >&2
+    total_ref=$((total_ref + 1))
+  done < "${out_file}"
+
+  # A non-core tag changes what a node means to each parser that reads it, so
+  # the scan cannot vouch for what the runner will do with that file.
+  if ! scan_yq "${out_file}" "${HOUSE_RULES_UNSUPPORTED_TAGS_EXPR}" "${file}"; then
+    house_rules::die "yq failed on ${shown_rel} after parsing it: $(< "${YQ_ERR_FILE}")"
+  fi
+  while IFS= read -r line; do
+    printf '%s: %s\n' "${shown_rel}" "${line}" >&2
     total_ref=$((total_ref + 1))
   done < "${out_file}"
 

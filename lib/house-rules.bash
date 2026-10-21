@@ -46,21 +46,13 @@ readonly HOUSE_RULES_WHERE_EXPR='(map(select(tag == "!!str") |= "." + '"${HOUSE_
 readonly HOUSE_RULES_CORE_TAG_EXPR='(. == "!!map" or . == "!!seq" or . == "!!str" or . == "!!null" or . == "!!int"
   or . == "!!bool" or . == "!!float")'
 
-# yq expression listing every construct the JSON conversion would silently
-# rewrite, anywhere in the file, one message each: merge keys (`<<`), aliases,
-# and tags other than the core ones, on keys or on values. An inline merge can
-# add an unknown key or override `step` unseen, so none may reach that
-# conversion.
+# yq expression listing every tag other than the core ones, on keys or on
+# values, anywhere in the file, one message each. A read that tests a node's
+# `type` sees its tag, so a structural map or list carrying a custom tag would
+# read as neither, and the JSON conversion drops such tags unseen.
 # shellcheck disable=SC2016 # $p is a yq variable, not a shell one
-readonly HOUSE_RULES_UNSUPPORTED_EXPR='
-([.. | select(type == "!!map") | {"path": path, "merges": [keys | .[] | select(tag == "!!merge")]}]
-  | map(.path as $p | .merges | map($p)) | flatten(1) | .[]
-  | '"${HOUSE_RULES_WHERE_EXPR}"'
-  | "merge key '"'"'<<'"'"' is not supported (in " + . + ")"),
-(.. | select(kind == "alias")
-  | "YAML alias '"'"'*" + (alias | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
-    + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")"),
-([.. | select(type == "!!map") | {"path": path, "tags": [keys | .[] | tag
+readonly HOUSE_RULES_UNSUPPORTED_TAGS_EXPR='
+([.. | select(kind == "map") | {"path": path, "tags": [keys | .[] | tag
     | select(. != "!!merge") | select('"${HOUSE_RULES_CORE_TAG_EXPR}"' | not)]}]
   | map(.path as $p | .tags | map({"path": $p, "tag": .})) | flatten(1) | .[]
   | "YAML tag '"'"'" + (.tag | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
@@ -69,6 +61,21 @@ readonly HOUSE_RULES_UNSUPPORTED_EXPR='
   | "YAML tag '"'"'" + (tag | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
     + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")")
 '
+
+# yq expression listing every construct the JSON conversion would silently
+# rewrite, anywhere in the file, one message each: merge keys (`<<`), aliases,
+# and tags other than the core ones. An inline merge can add an unknown key or
+# override `step` unseen, so none may reach that conversion.
+# shellcheck disable=SC2016 # $p is a yq variable, not a shell one
+readonly HOUSE_RULES_UNSUPPORTED_EXPR='
+([.. | select(kind == "map") | {"path": path, "merges": [keys | .[] | select(tag == "!!merge")]}]
+  | map(.path as $p | .merges | map($p)) | flatten(1) | .[]
+  | '"${HOUSE_RULES_WHERE_EXPR}"'
+  | "merge key '"'"'<<'"'"' is not supported (in " + . + ")"),
+(.. | select(kind == "alias")
+  | "YAML alias '"'"'*" + (alias | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
+    + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")"),
+'"${HOUSE_RULES_UNSUPPORTED_TAGS_EXPR}"
 
 # yq expression listing, escaped and one per line, every key of the map it is
 # given that is not in the comma-separated HOUSE_RULES_ALLOWED environment
@@ -83,7 +90,7 @@ readonly HOUSE_RULES_UNKNOWN_KEYS_EXPR='(keys | unique) - (strenv(HOUSE_RULES_AL
 # shellcheck disable=SC2016 # $where is a yq variable, not a shell one
 readonly HOUSE_RULES_DUPLICATE_KEYS_EXPR='
 (., (.[strenv(HOUSE_RULES_LINT)] | ..))
-| select(type == "!!map")
+| select(kind == "map")
 | select((keys | length) > (keys | unique | length))
 | (path | '"${HOUSE_RULES_WHERE_EXPR}"') as $where
 | keys | group_by(.) | map(select(length > 1) | .[0]) | .[]
