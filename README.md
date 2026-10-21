@@ -146,8 +146,8 @@ symlinks. It exits 0 when the config is valid and nothing is found, and 1 otherw
 Every command runs inside the repo's hermetic devShell through `.ci/in-devshell`. The `just` recipe beside each is an
 optional shortcut.
 
-- `./.ci/in-devshell ./run-all-checks`: `nix flake check`, the darwin evaluation check, the lints, then the tests
-  (`just check`)
+- `./.ci/in-devshell ./run-all-checks`: `nix flake check`, the darwin evaluation check, `check-workflow-hermetic` on
+  this repo's own workflows, the lints, then the tests (`just check`)
 - `./.ci/in-devshell ./.ci/check-darwin-eval`: evaluates every package, without building, for each darwin system the
   flake exports. CI runs on Linux only, and some consumers' devShells evaluate on macOS, so a package that fails to
   evaluate there would break them. The systems come from the flake's own `packages` outputs, so exporting no darwin
