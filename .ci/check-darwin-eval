@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 
-# @description Evaluate every package for the darwin systems, without building
-#              any. CI runs on Linux only, and three consumers' devShells
-#              evaluate on macOS, so a package that fails to evaluate there
-#              would break them while this repo's own gate stayed green.
+# @description Evaluate every package for every darwin system the flake
+#              exports, without building any. CI runs on Linux only, and some
+#              consumers' devShells evaluate on macOS, so a package that fails
+#              to evaluate there would break them while this repo's own gate
+#              stayed green.
+#
+#              The systems are the `-darwin` names among the flake's own
+#              `packages` outputs, so the check follows the `systems` input.
+#              A flake that exports no darwin system fails, and so does an
+#              unreadable export list: a check that evaluated nothing is not a
+#              pass, and a skip path would pass silently if darwin were ever
+#              dropped. Likewise a system with no packages fails.
 #
 #              Reading `drvPath` forces the evaluation of the derivation and
 #              nothing more; it does not build. The package names come from
-#              the flake itself, so a new lint is covered without an edit
-#              here. A system with no packages fails: a check that evaluated
-#              nothing is not a pass. A darwin system the flake does not
-#              export at all is skipped with a warning, because the `systems`
-#              input decides which systems exist and this check must not
-#              demand one it does not list.
+#              the flake too, so a new lint is covered without an edit here.
 #
 #              Failures aggregate, so one run names every package that does
 #              not evaluate. Must run inside the devShell (nix, yq).
@@ -20,8 +23,9 @@
 # @stderr progress as timestamped log lines; findings as plain lines,
 #         `check-darwin-eval: <system>.<name> does not evaluate`
 # @exitcode 0 every package evaluates on every exported darwin system.
-# @exitcode 1 a package does not evaluate, a system has no packages, a package
-#             list cannot be read, or an argument was given.
+# @exitcode 1 a package does not evaluate, a system has no packages, a list
+#             cannot be read, no darwin system is exported, or an argument was
+#             given.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -36,7 +40,6 @@ fi
 shopt -s inherit_errexit
 
 readonly NAME='check-darwin-eval'
-readonly DARWIN_SYSTEMS=('aarch64-darwin' 'x86_64-darwin')
 
 # One scratch directory for every temp file. A script-level variable, not a
 # local: the single-quoted EXIT trap expands it at exit, after any function's
@@ -60,12 +63,6 @@ function log_info() {
   log INFO "$*"
 }
 
-# @description Write a WARN line to stderr.
-# @arg $@ message text to print
-function log_warn() {
-  log WARN "$*"
-}
-
 # @description Print one finding as a plain line on stderr. Findings are the
 #              check's report output, not log lines.
 # @arg $1 problem what is wrong
@@ -84,16 +81,21 @@ function show_nix_error() {
   fi
 }
 
-# @description Report whether the flake exports packages for a system.
-# @arg $1 system the system to look for
-# @exitcode 0 the flake exports it.
-# @exitcode 1 it does not, or the export list cannot be read.
-function is_exported() {
-  local -r system="$1"
-  local -r exported_file="${TMP_DIR}/exported"
-  nix eval --json "${REPO_DIR}#packages" --apply builtins.attrNames > "${exported_file}" 2> '/dev/null' || return 1
-  yq --input-format json --output-format yaml '.[]' "${exported_file}" > "${exported_file}.names" || return 1
-  grep --fixed-strings --line-regexp --quiet -- "${system}" "${exported_file}.names"
+# @description Write the darwin systems the flake exports to a file, one per
+#              line.
+# @arg $1 out_file where to write the systems
+# @exitcode 0 the list was read, however many systems it holds.
+# @exitcode 1 the export list cannot be read.
+function list_darwin_systems() {
+  local -r out_file="$1"
+  local -r json_file="${TMP_DIR}/systems.json"
+  local -r err_file="${TMP_DIR}/systems.err"
+  if ! nix eval --json "${REPO_DIR}#packages" --apply builtins.attrNames > "${json_file}" 2> "${err_file}"; then
+    report 'cannot list the systems the flake exports'
+    show_nix_error "${err_file}"
+    return 1
+  fi
+  yq --input-format json --output-format yaml '.[] | select(test("-darwin$"))' "${json_file}" > "${out_file}"
 }
 
 # @description Evaluate every package of one system.
@@ -109,10 +111,6 @@ function check_system() {
 
   if ! nix eval --json "${REPO_DIR}#packages.${system}" --apply builtins.attrNames \
     > "${TMP_DIR}/${system}.json" 2> "${err_file}"; then
-    if ! is_exported "${system}"; then
-      log_warn "${system} is not exported; skipping"
-      return 0
-    fi
     report "cannot list packages for ${system}"
     show_nix_error "${err_file}"
     return 1
@@ -138,12 +136,23 @@ function check_system() {
   return "${status}"
 }
 
-# @description Check every darwin system and aggregate the exit codes.
+# @description Check every exported darwin system and aggregate the exit codes.
 # @noargs
 function main() {
   local rc=0
+  local -r systems_file="${TMP_DIR}/systems"
+  local -a systems=()
+  if list_darwin_systems "${systems_file}"; then
+    mapfile -t systems < "${systems_file}"
+    if ((${#systems[@]} == 0)); then
+      report 'the flake exports no darwin system'
+      rc=1
+    fi
+  else
+    rc=1
+  fi
   local system
-  for system in "${DARWIN_SYSTEMS[@]}"; do
+  for system in "${systems[@]}"; do
     check_system "${system}" || rc=1
   done
   # A check reporting its own verdict is not a crash: drop the ERR trap so the
