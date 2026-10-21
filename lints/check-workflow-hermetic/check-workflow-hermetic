@@ -490,13 +490,17 @@ function count_lines() {
 
 # @description Write the repo-relative path of every `*.yml` and `*.yaml` file
 #              under the scan roots to out_file, NUL-separated and sorted. A
-#              missing root is skipped; a root find cannot fully list dies, so
-#              an unreadable directory never reads as "no files". Symlinks are
+#              missing root is skipped. A root that exists but is not a
+#              directory, a dangling link included, is a violation rather than
+#              "no files", and a root find cannot fully list dies. Symlinks are
 #              followed, so a linked file or action directory is scanned, and
-#              a dangling link is listed for yq to reject.
+#              a dangling link below a root is listed for yq to reject.
 # @arg $1 out_file where to write the paths
+# @arg $2 total_var name of the violation counter to increase
+# @stderr `<root>: not a directory` per root that is not one
 function list_scan_files() {
   local -r out_file="$1"
+  local -n list_total_ref="$2"
   local -r unsorted_file="${TMP_DIR}/files-unsorted"
   local -r find_err_file="${TMP_DIR}/find-stderr"
   : > "${unsorted_file}" || house_rules::die "cannot write ${unsorted_file}"
@@ -504,6 +508,11 @@ function list_scan_files() {
   for root in "${SCAN_ROOTS[@]}"; do
     abs_root="${REPO_ROOT}/${root}"
     if [[ ! -e "${abs_root}" && ! -L "${abs_root}" ]]; then
+      continue
+    fi
+    if [[ ! -d "${abs_root}" ]]; then
+      printf '%s: not a directory\n' "${root}" >&2
+      list_total_ref=$((list_total_ref + 1))
       continue
     fi
     if ! find -L "${abs_root}" \( -type f -o -type l \) \( -name '*.yml' -o -name '*.yaml' \) \
@@ -719,9 +728,8 @@ function main() {
   done < "${exempt_file}"
 
   : > "${seen_file}" || house_rules::die "cannot write ${seen_file}"
-  list_scan_files "${files_file}"
-
   local total=0 rel
+  list_scan_files "${files_file}" total
   while IFS= read -r -d '' rel; do
     scan_file "${rel}" "${wrapper}" "${seen_file}" total
   done < "${files_file}"
