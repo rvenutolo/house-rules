@@ -462,23 +462,30 @@ function step_label() {
   fi
 }
 
-# @description Test whether a file holds a line exactly equal to the given
-#              text. A grep error dies rather than reading as "no such line",
-#              which would turn a stale-exemption check into a silent pass.
-# @arg $1 file the file to search
-# @arg $2 line the exact line to look for
-# @exitcode 0 the line is present
-# @exitcode 1 the line is absent
-function has_line() {
-  local -r file="$1"
-  local -r line="$2"
+# @description Store in the named variable how many lines of a file equal the
+#              given text exactly. A grep error dies rather than reading as
+#              zero, which would turn a stale-exemption check into a silent
+#              pass.
+# @arg $1 result_var name of the variable to set
+# @arg $2 file the file to search
+# @arg $3 line the exact line to count
+function count_lines() {
+  local -n count_ref="$1"
+  local -r file="$2"
+  local -r line="$3"
+  local -r count_file="${TMP_DIR}/line-count"
   local status=0
-  grep --quiet --fixed-strings --line-regexp -- "${line}" "${file}" || status=$?
-  case "${status}" in
-    0) return 0 ;;
-    1) return 1 ;;
-    *) house_rules::die "cannot search ${file}" ;;
-  esac
+  grep --count --fixed-strings --line-regexp -- "${line}" "${file}" > "${count_file}" || status=$?
+  if ((status > 1)); then
+    house_rules::die "cannot search ${file}"
+  fi
+  local counted
+  counted="$(< "${count_file}")" || house_rules::die "cannot read ${count_file}"
+  if [[ ! "${counted}" =~ ^[0-9]+$ ]]; then
+    house_rules::die "unexpected line count '${counted}' for ${file}"
+  fi
+  # shellcheck disable=SC2034 # set through the nameref; the caller reads it
+  count_ref="${counted}"
 }
 
 # @description Write the repo-relative path of every `*.yml` and `*.yaml` file
@@ -591,8 +598,12 @@ function scan_file() {
     house_rules::die "yq failed on ${shown_rel} after parsing it: $(< "${YQ_ERR_FILE}")"
   fi
 
+  # Two passes: whether a step is exempt depends on how many run steps in the
+  # file share its key, since ids are unique only within a job and document.
   local job_b64 index_b64 id_b64 id_unsafe name_b64 compliant extra
   local job index id name key label shown_id
+  local -a record_keys=()
+  local -A key_counts=()
   while IFS='|' read -r job_b64 index_b64 id_b64 id_unsafe name_b64 compliant extra; do
     if [[ -n "${extra}" || ! "${id_unsafe}" =~ ^(true|false)$ || ! "${compliant}" =~ ^(true|false)$ ]]; then
       house_rules::die "unexpected step record for ${shown_rel}"
@@ -603,18 +614,29 @@ function scan_file() {
     # in it would forge extra lines in seen_file.
     if [[ -n "${id}" && "${id_unsafe}" == 'false' && "${rel}" != *[[:cntrl:]]* ]]; then
       key="${rel}::${id}"
+      key_counts["${key}"]=$((${key_counts["${key}"]:-0} + 1))
       if [[ "${compliant}" == 'true' ]]; then
         printf '%s|1\n' "${key}" >> "${seen_file}" || house_rules::die "cannot write ${seen_file}"
       else
         printf '%s|0\n' "${key}" >> "${seen_file}" || house_rules::die "cannot write ${seen_file}"
       fi
     fi
+    record_keys+=("${key}")
+  done < "${steps_file}"
+
+  local record_index=0
+  while IFS='|' read -r job_b64 index_b64 id_b64 id_unsafe name_b64 compliant extra; do
+    key="${record_keys[record_index]}"
+    record_index=$((record_index + 1))
     if [[ "${compliant}" == 'true' ]]; then
       continue
     fi
-    if [[ -n "${key}" && -n "${EXEMPT_STEPS["${key}"]+set}" ]]; then
+    # An exemption shared by several steps covers none of them; report_stale
+    # reports it as ambiguous.
+    if [[ -n "${key}" && -n "${EXEMPT_STEPS["${key}"]+set}" && "${key_counts["${key}"]}" == '1' ]]; then
       continue
     fi
+    decode_field id "${id_b64}"
     if [[ -z "${id}" && "${id_unsafe}" == 'false' ]]; then
       decode_field job "${job_b64}"
       decode_field index "${index_b64}"
@@ -630,15 +652,18 @@ function scan_file() {
   done < "${steps_file}"
 }
 
-# @description Report every exemption that covers no non-compliant run step:
-#              one naming no run step at all, or naming only steps that already
-#              use the wrapper. A key shared by a wrapped and an unwrapped step
-#              is still needed by the unwrapped one, so it is not stale.
+# @description Report every exemption that does not cover exactly one
+#              non-compliant run step. It is stale when it names no run step,
+#              or names only steps that already use the wrapper, however many.
+#              It is ambiguous when it names a non-compliant step and at least
+#              one other run step: ids are unique only within a job and
+#              document, and one exemption silently covering several steps
+#              would let a new step inherit an old reason.
 # @arg $1 exempt_file the exempt steps, one per line
 # @arg $2 seen_file the keyed run steps, as written by scan_file
 # @arg $3 wrapper the wrapper a compliant run body names
 # @arg $4 total_var name of the violation counter to increase
-# @stderr one line per stale exemption
+# @stderr one line per stale or ambiguous exemption
 function report_stale() {
   local -r exempt_file="$1"
   local -r seen_file="$2"
@@ -647,16 +672,20 @@ function report_stale() {
   local shown_wrapper
   printable shown_wrapper "${wrapper}"
   house_rules::require_file "${exempt_file}"
-  local entry
+  local entry unwrapped wrapped
   while IFS= read -r entry; do
-    if has_line "${seen_file}" "${entry}|0"; then
-      continue
-    fi
-    if has_line "${seen_file}" "${entry}|1"; then
+    count_lines unwrapped "${seen_file}" "${entry}|0"
+    count_lines wrapped "${seen_file}" "${entry}|1"
+    if ((unwrapped == 0 && wrapped == 0)); then
+      printf 'stale exemption in %s: %s matches no run step\n' "${HOUSE_RULES_CONFIG}" "${entry}" >&2
+    elif ((unwrapped == 0)); then
       printf 'stale exemption in %s: %s already invokes %s\n' "${HOUSE_RULES_CONFIG}" "${entry}" \
         "${shown_wrapper}" >&2
+    elif ((unwrapped + wrapped > 1)); then
+      printf 'ambiguous exemption in %s: %s matches %d run steps; give each step a unique id\n' \
+        "${HOUSE_RULES_CONFIG}" "${entry}" "$((unwrapped + wrapped))" >&2
     else
-      printf 'stale exemption in %s: %s matches no run step\n' "${HOUSE_RULES_CONFIG}" "${entry}" >&2
+      continue
     fi
     stale_total_ref=$((stale_total_ref + 1))
   done < "${exempt_file}"
