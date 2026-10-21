@@ -965,8 +965,9 @@ jobs:
 EOF
   run --separate-stderr check-workflow-hermetic
   assert_failure 1
-  assert_stderr - << 'EOF'
-.github/workflows/a.yml: job 'build' step #0 (Run BATS) does not invoke .ci/in-devshell and has no YAML id:; add one (.house-rules.yml exemptions are keyed <file>::<id>)
+  local -r fix='has no YAML id:; add one (.house-rules.yml exemptions are keyed <file>::<id>)'
+  assert_stderr - << EOF
+.github/workflows/a.yml: job 'build' step #0 (Run BATS) does not invoke .ci/in-devshell and ${fix}
 1 hermetic-boundary violation(s)
 EOF
 }
@@ -1174,6 +1175,50 @@ EOF
   assert_output --partial '.github/actions/a/action.yml: spells'
 }
 
+@test 'fails: the direct spelling split by a shell line continuation' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  build:
+    steps:
+      - id: direct
+        run: |
+          ./.ci/in-devshell true
+          nix \
+            develop --command ./check-scripts
+EOF
+  run check-workflow-hermetic
+  assert_failure 1
+  assert_output --partial '.github/workflows/a.yml: spells'
+}
+
+@test 'passes: nix-installer-action does not match the forbidden spelling' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  build:
+    steps:
+      - uses: DeterminateSystems/nix-installer-action@v1
+      - name: do
+        run: ./.ci/in-devshell nix-installer-action develop
+EOF
+  run check-workflow-hermetic
+  assert_success
+}
+
+@test 'passes: nixdevelop does not match the forbidden spelling' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  build:
+    steps:
+      - name: do
+        run: ./.ci/in-devshell nixdevelop
+EOF
+  run check-workflow-hermetic
+  assert_success
+}
+
 # ---- exemptions ----
 
 @test 'passes: an exempt step may skip the wrapper' {
@@ -1281,7 +1326,7 @@ EOF
   assert_line '2 hermetic-boundary violation(s)'
 }
 
-@test 'passes: an exemption shared by a wrapped and an unwrapped step of one id' {
+@test 'fails: an exemption shared by a wrapped and an unwrapped step of one id is ambiguous' {
   write_fixture .github/workflows/a.yml << 'EOF'
 on: push
 jobs:
@@ -1300,8 +1345,120 @@ check-workflow-hermetic:
     - step: .github/workflows/a.yml::build
       reason: Runs before Nix is installed.
 EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  local -r hint='give each step a unique id'
+  assert_stderr - << EOF
+.github/workflows/a.yml::build: run step does not invoke .ci/in-devshell
+ambiguous exemption in .house-rules.yml: .github/workflows/a.yml::build matches 2 run steps; ${hint}
+2 hermetic-boundary violation(s)
+EOF
+}
+
+@test 'fails: an exemption for an id shared by two jobs is ambiguous' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  j:
+    steps:
+      - id: x
+        run: echo PAYLOAD
+  k:
+    steps:
+      - id: x
+        run: echo PAYLOAD
+EOF
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: .github/workflows/a.yml::x
+      reason: Runs before Nix is installed.
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.github/workflows/a.yml::x: run step does not invoke .ci/in-devshell
+.github/workflows/a.yml::x: run step does not invoke .ci/in-devshell
+ambiguous exemption in .house-rules.yml: .github/workflows/a.yml::x matches 2 run steps; give each step a unique id
+3 hermetic-boundary violation(s)
+EOF
+}
+
+@test 'fails: an exemption for an id shared by two YAML documents is ambiguous' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+jobs:
+  j:
+    steps:
+      - id: x
+        run: echo PAYLOAD
+---
+jobs:
+  j:
+    steps:
+      - id: x
+        run: echo PAYLOAD
+EOF
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: .github/workflows/a.yml::x
+      reason: Runs before Nix is installed.
+EOF
   run check-workflow-hermetic
-  assert_success
+  assert_failure 1
+  assert_output --partial \
+    'ambiguous exemption in .house-rules.yml: .github/workflows/a.yml::x matches 2 run steps; give each step'
+  assert_line '3 hermetic-boundary violation(s)'
+}
+
+@test 'fails: an exemption for an id shared by two wrapped steps is stale' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  j:
+    steps:
+      - id: x
+        run: ./.ci/in-devshell make
+  k:
+    steps:
+      - id: x
+        run: ./.ci/in-devshell make
+EOF
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - step: .github/workflows/a.yml::x
+      reason: Runs before Nix is installed.
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+stale exemption in .house-rules.yml: .github/workflows/a.yml::x already invokes .ci/in-devshell
+1 hermetic-boundary violation(s)
+EOF
+}
+
+@test 'fails: .github/workflows is a regular file' {
+  mkdir --parents "${FIXTURE_REPO}/.github"
+  printf 'not a dir\n' > "${FIXTURE_REPO}/.github/workflows"
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.github/workflows: not a directory
+1 hermetic-boundary violation(s)
+EOF
+}
+
+@test 'fails: .github/actions is a symlink to a regular file' {
+  mkdir --parents "${FIXTURE_REPO}/.github"
+  printf 'not a dir\n' > "${FIXTURE_REPO}/actions-file"
+  ln --symbolic ../actions-file "${FIXTURE_REPO}/.github/actions"
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.github/actions: not a directory
+1 hermetic-boundary violation(s)
+EOF
 }
 
 # ---- file discovery ----
@@ -1569,8 +1726,9 @@ jobs:
 EOF
   run --separate-stderr check-workflow-hermetic
   assert_failure 1
-  assert_stderr - << 'EOF'
-.github/workflows/a.yml: job 'a|b\nc' step #0 (x|y) does not invoke .ci/in-devshell and has no YAML id:; add one (.house-rules.yml exemptions are keyed <file>::<id>)
+  local -r fix='has no YAML id:; add one (.house-rules.yml exemptions are keyed <file>::<id>)'
+  assert_stderr - << EOF
+.github/workflows/a.yml: job 'a|b\nc' step #0 (x|y) does not invoke .ci/in-devshell and ${fix}
 1 hermetic-boundary violation(s)
 EOF
 }
@@ -1615,4 +1773,124 @@ EOF
   run check-workflow-hermetic
   assert_failure 1
   assert_output --partial '.github/workflows/a.yml::nul: run step does not invoke'
+}
+
+# ---- non-core YAML tags ----
+
+# @description Assert the run failed on an unsupported tag at the given place
+#              and still reported the unwrapped step `bare` in a.yml.
+# @arg $1 where the tag's location as the message prints it
+function assert_tag_rejected() {
+  local -r where="$1"
+  assert_failure 1
+  assert_output --partial ".github/workflows/a.yml: YAML tag '!x' is not supported (in ${where})"
+  assert_output --partial '.github/workflows/a.yml::bare: run step does not invoke'
+}
+
+@test 'fails: a custom tag on jobs' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs: !x
+  build:
+    steps:
+      - id: bare
+        run: echo PAYLOAD
+EOF
+  run check-workflow-hermetic
+  assert_tag_rejected 'jobs'
+}
+
+@test 'fails: a custom tag on a job' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  build: !x
+    steps:
+      - id: bare
+        run: echo PAYLOAD
+EOF
+  run check-workflow-hermetic
+  assert_tag_rejected 'jobs.build'
+}
+
+@test 'fails: a custom tag on steps' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  build:
+    steps: !x
+      - id: bare
+        run: echo PAYLOAD
+EOF
+  run check-workflow-hermetic
+  assert_tag_rejected 'jobs.build.steps'
+}
+
+@test 'fails: a custom tag on a step' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  build:
+    steps:
+      - !x
+        id: bare
+        run: echo PAYLOAD
+EOF
+  run check-workflow-hermetic
+  assert_tag_rejected 'jobs.build.steps[0]'
+}
+
+@test 'fails: a custom tag on the document root' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+--- !x
+on: push
+jobs:
+  build:
+    steps:
+      - id: bare
+        run: echo PAYLOAD
+EOF
+  run check-workflow-hermetic
+  assert_tag_rejected 'top level'
+}
+
+@test 'fails: a custom tag on runs in an action' {
+  write_fixture .github/actions/a/action.yml << 'EOF'
+runs: !x
+  using: composite
+  steps:
+    - id: bare
+      shell: bash
+      run: echo PAYLOAD
+EOF
+  run check-workflow-hermetic
+  assert_failure 1
+  assert_output --partial ".github/actions/a/action.yml: YAML tag '!x' is not supported (in runs)"
+  assert_output --partial '.github/actions/a/action.yml::bare: run step does not invoke'
+}
+
+@test 'fails: an !!omap tag on a job' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+jobs:
+  build: !!omap
+    steps:
+      - id: bare
+        run: echo PAYLOAD
+EOF
+  run check-workflow-hermetic
+  assert_failure 1
+  assert_output --partial ".github/workflows/a.yml: YAML tag '!!omap' is not supported (in jobs.build)"
+}
+
+@test 'fails: a custom tag does not stop the scan of other files' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: !x push
+EOF
+  write_bare_step_workflow
+  run check-workflow-hermetic
+  assert_failure 1
+  assert_output --partial ".github/workflows/a.yml: YAML tag '!x' is not supported (in on)"
+  assert_output --partial '.github/workflows/ci.yml::bare: run step does not invoke'
+  assert_line '2 hermetic-boundary violation(s)'
 }
