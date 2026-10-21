@@ -56,10 +56,10 @@ readonly HOUSE_RULES_UNSUPPORTED_TAGS_EXPR='
     | select(. != "!!merge") | select('"${HOUSE_RULES_CORE_TAG_EXPR}"' | not)]}]
   | map(.path as $p | .tags | map({"path": $p, "tag": .})) | flatten(1) | .[]
   | "YAML tag '"'"'" + (.tag | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
-    + (.path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")"),
+    + (.path | '"${HOUSE_RULES_WHERE_EXPR}"') + "); quote the value or drop the tag"),
 (.. | select(kind != "alias") | select(tag | '"${HOUSE_RULES_CORE_TAG_EXPR}"' | not)
   | "YAML tag '"'"'" + (tag | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
-    + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")")
+    + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + "); quote the value or drop the tag")
 '
 
 # yq expression listing every construct the JSON conversion would silently
