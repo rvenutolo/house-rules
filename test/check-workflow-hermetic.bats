@@ -2,6 +2,9 @@
 
 bats_require_minimum_version 1.5.0
 
+# What the unsupported-tag message tells the user to do.
+readonly TAG_FIX='; quote the value or drop the tag'
+
 function setup() {
   load test_helper/common
   make_repo
@@ -680,8 +683,8 @@ check-workflow-hermetic:
 EOF
   run --separate-stderr check-workflow-hermetic
   assert_failure 1
-  assert_stderr - << 'EOF'
-.house-rules.yml: YAML tag '!custom' is not supported (in check-workflow-hermetic)
+  assert_stderr - << EOF
+.house-rules.yml: YAML tag '!custom' is not supported (in check-workflow-hermetic)${TAG_FIX}
 1 .house-rules.yml error(s)
 EOF
 }
@@ -693,8 +696,8 @@ check-workflow-hermetic:
 EOF
   run --separate-stderr check-workflow-hermetic
   assert_failure 1
-  assert_stderr - << 'EOF'
-.house-rules.yml: YAML tag '!custom' is not supported (in check-workflow-hermetic.wrapper)
+  assert_stderr - << EOF
+.house-rules.yml: YAML tag '!custom' is not supported (in check-workflow-hermetic.wrapper)${TAG_FIX}
 1 .house-rules.yml error(s)
 EOF
 }
@@ -708,8 +711,8 @@ check-workflow-hermetic:
 EOF
   run --separate-stderr check-workflow-hermetic
   assert_failure 1
-  assert_stderr - << 'EOF'
-.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt[0].step)
+  assert_stderr - << EOF
+.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt[0].step)${TAG_FIX}
 1 .house-rules.yml error(s)
 EOF
 }
@@ -722,8 +725,8 @@ check-workflow-hermetic:
 EOF
   run --separate-stderr check-workflow-hermetic
   assert_failure 1
-  assert_stderr - << 'EOF'
-.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt[0])
+  assert_stderr - << EOF
+.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt[0])${TAG_FIX}
 1 .house-rules.yml error(s)
 EOF
 }
@@ -736,8 +739,8 @@ check-workflow-hermetic:
 EOF
   run --separate-stderr check-workflow-hermetic
   assert_failure 1
-  assert_stderr - << 'EOF'
-.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt)
+  assert_stderr - << EOF
+.house-rules.yml: YAML tag '!foo' is not supported (in check-workflow-hermetic.exempt)${TAG_FIX}
 1 .house-rules.yml error(s)
 EOF
 }
@@ -1783,7 +1786,7 @@ EOF
 function assert_tag_rejected() {
   local -r where="$1"
   assert_failure 1
-  assert_output --partial ".github/workflows/a.yml: YAML tag '!x' is not supported (in ${where})"
+  assert_output --partial ".github/workflows/a.yml: YAML tag '!x' is not supported (in ${where})${TAG_FIX}"
   assert_output --partial '.github/workflows/a.yml::bare: run step does not invoke'
 }
 
@@ -1865,7 +1868,7 @@ runs: !x
 EOF
   run check-workflow-hermetic
   assert_failure 1
-  assert_output --partial ".github/actions/a/action.yml: YAML tag '!x' is not supported (in runs)"
+  assert_output --partial ".github/actions/a/action.yml: YAML tag '!x' is not supported (in runs)${TAG_FIX}"
   assert_output --partial '.github/actions/a/action.yml::bare: run step does not invoke'
 }
 
@@ -1880,7 +1883,7 @@ jobs:
 EOF
   run check-workflow-hermetic
   assert_failure 1
-  assert_output --partial ".github/workflows/a.yml: YAML tag '!!omap' is not supported (in jobs.build)"
+  assert_output --partial ".github/workflows/a.yml: YAML tag '!!omap' is not supported (in jobs.build)${TAG_FIX}"
 }
 
 @test 'fails: a custom tag does not stop the scan of other files' {
@@ -1890,7 +1893,25 @@ EOF
   write_bare_step_workflow
   run check-workflow-hermetic
   assert_failure 1
-  assert_output --partial ".github/workflows/a.yml: YAML tag '!x' is not supported (in on)"
+  assert_output --partial ".github/workflows/a.yml: YAML tag '!x' is not supported (in on)${TAG_FIX}"
   assert_output --partial '.github/workflows/ci.yml::bare: run step does not invoke'
   assert_line '2 hermetic-boundary violation(s)'
+}
+
+@test 'fails: an unquoted date in a workflow names the fix' {
+  write_fixture .github/workflows/a.yml << 'EOF'
+on: push
+env: { RELEASE_DATE: 2024-01-01 }
+jobs:
+  build:
+    steps:
+      - id: ok
+        run: ./.ci/in-devshell ./check
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << EOF
+.github/workflows/a.yml: YAML tag '!!timestamp' is not supported (in env.RELEASE_DATE)${TAG_FIX}
+1 hermetic-boundary violation(s)
+EOF
 }
