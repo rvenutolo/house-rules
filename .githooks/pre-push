@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+
+# @description Git pre-push hook: runs the full gate inside the devShell and
+#              aborts the push if it fails. Bypass with `git push --no-verify`.
+# @noargs
+# @exitcode 0 the gate passed.
+# @exitcode 1 the gate failed.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+
+function main() {
+  local repo_dir
+  repo_dir="$(git rev-parse --show-toplevel)"
+  printf 'pre-push: running the full local gate\n' >&2
+  if ! "${repo_dir}/.ci/in-devshell" ./run-all-checks; then
+    printf 'pre-push: gate failed; fix it, or rerun with --no-verify to bypass\n' >&2
+    exit 1
+  fi
+  printf 'pre-push: gate passed\n' >&2
+}
+
+main "$@"

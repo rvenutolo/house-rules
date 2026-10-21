@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+
+# @description Run every verify-only linter over the tracked files: shellcheck
+#              and shfmt over the shell scripts, `just --fmt`, statix and
+#              deadnix over the Nix files, actionlint and zizmor over the
+#              workflows, yamllint, markdownlint and typos. Formatting of
+#              everything else is `nix flake check`'s job.
+#
+#              Exit codes aggregate rather than fail fast, so one run surfaces
+#              every failing category. A step whose tracked file list is empty
+#              fails: a lint that checked nothing is not a clean pass. Must run
+#              inside the devShell.
+# @noargs
+# @exitcode 0 every linter passed.
+# @exitcode 1 one or more linters failed, or a file list was empty.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+
+# bash 4.4 for `inherit_errexit` and namerefs; the devShell's bash satisfies it.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  printf '%s: bash 4.4+ required (found %s.%s)\n' "${0##*/}" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" >&2
+  exit 1
+fi
+shopt -s inherit_errexit
+
+# Scratch file for command output (no process substitution). A script-level
+# variable, not a local: the single-quoted EXIT trap expands it at exit, after
+# any function's locals are gone.
+TMP_FILE="$(mktemp)"
+readonly TMP_FILE
+trap 'rm --force -- "${TMP_FILE}"' EXIT
+
+# @description Print a progress line to stderr.
+# @arg $1 message text to print
+function log() {
+  local -r message="$1"
+  printf '[%s] %s\n' "${0##*/}" "${message}" >&2
+}
+
+# @description Load the tracked files matching the pathspecs into an array.
+# @arg $1 array_name name of the array to fill
+# @arg $@ pathspecs git pathspecs to list
+function load_tracked() {
+  local -n files_ref="$1"
+  shift
+  git ls-files -- "$@" > "${TMP_FILE}"
+  # shellcheck disable=SC2034 # filled through the nameref; the caller reads it
+  mapfile -t files_ref < "${TMP_FILE}"
+}
+
+# @description Load the tracked shell scripts into an array: every `*.bash` and
+#              `*.bats`, plus the extensionless executables under `.ci/`,
+#              `.githooks/`, `lints/` and the repo root.
+# @arg $1 array_name name of the array to fill
+function load_shell_files() {
+  local -n shell_files_ref="$1"
+  shell_files_ref=()
+  git ls-files --stage > "${TMP_FILE}"
+  local mode path name in_scope
+  while IFS=$' \t' read -r mode _ _ path; do
+    name="${path##*/}"
+    case "${name}" in
+      *.bash | *.bats)
+        shell_files_ref+=("${path}")
+        continue
+        ;;
+      *) ;;
+    esac
+    in_scope=0
+    case "${path}" in
+      .ci/* | .githooks/* | lints/*) in_scope=1 ;;
+      */*) ;;
+      *) in_scope=1 ;;
+    esac
+    if ((in_scope == 1)) && [[ "${mode}" == '100755' && "${name}" != *.* ]]; then
+      shell_files_ref+=("${path}")
+    fi
+  done < "${TMP_FILE}"
+}
+
+# @description Fail the run when a file list is empty.
+# @arg $1 label what the list holds, for the message
+# @arg $2 count number of files in the list
+# @exitcode 1 the list is empty.
+function require_files() {
+  local -r label="$1"
+  local -r count="$2"
+  if ((count == 0)); then
+    log "no ${label} found; this is a failure, not a clean pass"
+    return 1
+  fi
+}
+
+# @description Run every linter and aggregate the exit codes.
+# @noargs
+function main() {
+  local repo_dir
+  repo_dir="$(git rev-parse --show-toplevel)"
+  cd "${repo_dir}"
+
+  local rc=0
+  local -a shell_files=() bats_files=() other_shell_files=() nix_files=() workflow_files=()
+  local -a yaml_files=() md_files=() text_files=()
+
+  log 'running shellcheck'
+  load_shell_files shell_files
+  if require_files 'shell files' "${#shell_files[@]}"; then
+    # LC_ALL: the hermetic shell sets no locale, and shellcheck then dies on
+    # any non-ASCII character in a finding.
+    LC_ALL=C.UTF-8 shellcheck --external-sources "${shell_files[@]}" || rc=1
+  else
+    rc=1
+  fi
+
+  log 'running shfmt (verify only)'
+  local shell_file
+  for shell_file in "${shell_files[@]}"; do
+    case "${shell_file}" in
+      *.bats) bats_files+=("${shell_file}") ;;
+      *) other_shell_files+=("${shell_file}") ;;
+    esac
+  done
+  if ((${#other_shell_files[@]} > 0)); then
+    shfmt --list --diff --indent 2 --case-indent --binary-next-line --space-redirects \
+      "${other_shell_files[@]}" || rc=1
+  fi
+  if ((${#bats_files[@]} > 0)); then
+    shfmt --list --diff --indent 2 --case-indent --binary-next-line --space-redirects \
+      --language-dialect bats "${bats_files[@]}" || rc=1
+  fi
+
+  log 'running just --fmt (verify only)'
+  # --unstable: `--fmt` is still an unstable subcommand.
+  just --fmt --check --unstable --justfile "${repo_dir}/.justfile" || rc=1
+
+  log 'running statix and deadnix'
+  load_tracked nix_files '*.nix'
+  if require_files 'nix files' "${#nix_files[@]}"; then
+    local nix_file
+    for nix_file in "${nix_files[@]}"; do
+      statix check "${nix_file}" || rc=1
+    done
+    deadnix --fail "${nix_files[@]}" || rc=1
+  else
+    rc=1
+  fi
+
+  log 'running actionlint'
+  load_tracked workflow_files '.github/workflows/*.yml' '.github/workflows/*.yaml'
+  if require_files 'workflow files' "${#workflow_files[@]}"; then
+    actionlint "${workflow_files[@]}" || rc=1
+  else
+    rc=1
+  fi
+
+  log 'running zizmor'
+  # --no-online-audits: the gate needs no network for this.
+  zizmor --no-online-audits .github/ || rc=1
+
+  log 'running yamllint'
+  load_tracked yaml_files '*.yml' '*.yaml'
+  if require_files 'yaml files' "${#yaml_files[@]}"; then
+    yamllint --strict "${yaml_files[@]}" || rc=1
+  else
+    rc=1
+  fi
+
+  log 'running markdownlint'
+  load_tracked md_files '*.md'
+  if require_files 'markdown files' "${#md_files[@]}"; then
+    markdownlint-cli2 "${md_files[@]}" || rc=1
+  else
+    rc=1
+  fi
+
+  log 'running typos'
+  # Every tracked text file. A bare `typos` skips hidden paths (.ci, .github)
+  # and walks untracked ones.
+  git grep -I --files-with-matches '' > "${TMP_FILE}" || true # exit 1 means no text files; caught below
+  mapfile -t text_files < "${TMP_FILE}"
+  if require_files 'text files' "${#text_files[@]}"; then
+    typos "${text_files[@]}" || rc=1
+  else
+    rc=1
+  fi
+
+  if ((rc != 0)); then
+    log 'one or more linters failed'
+  fi
+  # A gate reporting its own verdict is not a crash: drop the ERR trap so the
+  # diagnostics above are the last thing the reader sees.
+  trap - ERR
+  return "${rc}"
+}
+
+main "$@"
