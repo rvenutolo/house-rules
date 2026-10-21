@@ -4,12 +4,38 @@
 #              it inside the repo's hermetic Nix devShell wrapper. Reads its
 #              exemptions and wrapper path from the `check-workflow-hermetic`
 #              section of `.house-rules.yml` at the repo root, and fails on any
-#              error in that file before scanning anything.
+#              error in that file before scanning anything. Scans every `*.yml`
+#              and `*.yaml` file under `.github/workflows` and `.github/actions`,
+#              recursively, following symlinks.
+#
+#              Rule 1: every step carrying a `run:` key names the wrapper in its
+#              run body, or is exempted. A step that shells out on the bare
+#              runner resolves its tools from whatever the runner image ships,
+#              which is the ambient-dependency drift the boundary exists to
+#              prevent. The check is a substring test on the whole body: a
+#              per-command rule would need a quote-aware split, or the inner
+#              script of `<wrapper> bash -c '...'` would read as unwrapped
+#              commands. Rule 2 closes the gap that leaves.
+#
+#              Rule 2: no scanned file enters the devShell directly. That belongs
+#              to the wrapper alone, because the wrapper supplies the cleared
+#              environment and its allowlist; a direct entry looks correct while
+#              being no boundary at all.
+#
+#              Exemptions are keyed `<repo-relative-file>::<step-id>`, and
+#              staleness is checked both ways: an exemption naming no run step,
+#              or naming only steps that already use the wrapper, is a
+#              violation. A non-compliant step with no `id:` is reported with
+#              the fix, because its `name:` is free text and drifts.
 # @arg $1 --help print usage and exit
 # @stdout the usage line, with --help
-# @stderr one line per config error, then `<N> .house-rules.yml error(s)`
-# @exitcode 0 the config is valid
-# @exitcode 1 a config error, an unexpected argument, or not inside a git repository
+# @stderr one line per config error, then `<N> .house-rules.yml error(s)`; or
+#         one line per violation or stale exemption, then
+#         `<N> hermetic-boundary violation(s)`
+# @exitcode 0 the config is valid and no violation was found
+# @exitcode 1 a config error, a violation, a stale exemption, an unexpected
+#             argument, a scan root that cannot be listed, or not inside a git
+#             repository
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -35,6 +61,79 @@ shopt -s inherit_errexit
 readonly LINT='check-workflow-hermetic'
 readonly DEFAULT_WRAPPER='.ci/in-devshell'
 readonly USAGE="usage: ${LINT} [--help]"
+
+# The exempt steps, filled by main once the config is valid. Script-level so
+# scan_file can test membership without passing an associative array around.
+declare -A EXEMPT_STEPS=()
+
+# The directories scanned, relative to the repo root. Exemption keys start
+# with these.
+readonly SCAN_ROOTS=('.github/workflows' '.github/actions')
+
+# The forbidden direct-entry spelling is assembled from two words, and matched
+# as a regex with a class where its space would be, so this source never
+# contains the string it forbids: the user's repos scan their trees for it. The
+# class also tolerates runs of whitespace, newlines included. The outer classes
+# are word boundaries, so `in-devshell` and `nix-installer-action` do not
+# match. The pattern is valid both as a grep ERE and as a Go regexp for yq.
+readonly NIX_WORD='nix'
+readonly DEVELOP_WORD='develop'
+readonly FORBIDDEN_SPELLING="${NIX_WORD} ${DEVELOP_WORD}"
+readonly FORBIDDEN_PATTERN="(^|[^[:alnum:]_-])${NIX_WORD}[[:space:]]+${DEVELOP_WORD}([^[:alnum:]_-]|\$)"
+
+# yq expression counting, per document, the scalar values whose decoded text
+# matches HOUSE_RULES_FORBIDDEN_PATTERN. The raw-text grep misses a spelling
+# split by plain-scalar line folding or written with an escape such as `\x20`;
+# the decoded value shows both.
+readonly DIRECT_SCALARS_EXPR='[.. | select(kind == "scalar") | tostring
+  | select(test(strenv(HOUSE_RULES_FORBIDDEN_PATTERN)))] | length'
+
+# yq expression listing every duplicate mapping key anywhere in a document, one
+# message per key. yq keeps only the last of a duplicated key, so a duplicated
+# `jobs` or `run` would hide the first value from every later read.
+# shellcheck disable=SC2016 # $where is a yq variable, not a shell one
+readonly WORKFLOW_DUPLICATE_KEYS_EXPR='
+.. | select(type == "!!map")
+| select((keys | length) > (keys | unique | length))
+| (path | '"${HOUSE_RULES_WHERE_EXPR}"') as $where
+| keys | group_by(.) | map(select(length > 1) | .[0]) | .[]
+| "duplicate key '"'"'" + '"${HOUSE_RULES_ESCAPE_EXPR}"' + "'"'"' in " + $where
+'
+
+# yq expression emitting one record per step that carries a `run:` key, for
+# both the workflow (`.jobs[].steps[]`) and composite-action (`.runs.steps[]`)
+# shapes. The record is built by concatenation, not `[...] | join`: on an empty
+# stream yq still builds the array and prints an empty line. explode(.)
+# resolves aliases and merge keys first, so a step, steps list or run body
+# reached through one is still seen; the caller runs yq with merge keys
+# resolved to the YAML spec, where a local key beats a merged one.
+# A record is `job|index|id|id_unsafe|name|compliant`: job, index, id and name
+# are base64, so a `|` or newline in them cannot break the record apart, and an
+# absent id or name encodes as empty. id_unsafe is true when the id holds a
+# control character, which no exemption can name. compliant is true only for a
+# plain string body containing HOUSE_RULES_WRAPPER, tested here on the real
+# string: a NUL in the body cannot vanish the way it would in bash.
+# shellcheck disable=SC2016 # $job is a yq variable, not a shell one
+readonly EXTRACT_RUN_STEPS_EXPR='
+explode(.) | select(type == "!!map")
+| [
+    (.jobs | select(type == "!!map" or type == "!!seq") | to_entries | .[] | .key as $job
+      | .value | select(type == "!!map") | .steps | select(type == "!!seq" or type == "!!map")
+      | to_entries | .[] | {"j": ($job | tostring), "i": (.key | tostring), "v": .value}),
+    (.runs | select(type == "!!map") | .steps | select(type == "!!seq" or type == "!!map")
+      | to_entries | .[] | {"j": "runs", "i": (.key | tostring), "v": .value})
+  ]
+| .[]
+| select(.v | type == "!!map")
+| select(.v | has("run"))
+| ((.v.id // "") | tostring) as $id
+| (.j | @base64)
+  + "|" + (.i | @base64)
+  + "|" + ($id | @base64)
+  + "|" + ($id | test("[[:cntrl:]]") | tostring)
+  + "|" + ((.v.name // "") | tostring | @base64)
+  + "|" + (((.v.run | select(tag == "!!str") | contains(strenv(HOUSE_RULES_WRAPPER))) // false) | tostring)
+'
 
 # The validators return their error count, so callers test their status and
 # errexit is off inside them. Every helper below therefore checks each command
@@ -297,13 +396,268 @@ function validate_section() {
   house_rules::return_count "${errors}"
 }
 
-# @description Validate the config, then run the lint.
+# @description Run yq on a scanned file with its stdout in out_file and its
+#              stderr in YQ_ERR_FILE. Unlike house_rules::yq it does not die:
+#              a file yq cannot read is a violation for the caller to report,
+#              not a crash. Merge keys resolve to the YAML spec, where a local
+#              key beats a merged one, rather than yq's default, where the
+#              merged key wins and a wrapped run body could stand in for the
+#              one that actually runs.
+# @arg $1 out_file where to write yq's stdout
+# @arg $2 expr the yq expression
+# @arg $3 file the file to read
+# @exitcode 0 yq succeeded
+# @exitcode 1 yq failed
+function scan_yq() {
+  local -r out_file="$1"
+  local -r expr="$2"
+  local -r file="$3"
+  if ! yq --yaml-fix-merge-anchor-to-spec=true --input-format=yaml --output-format=yaml "${expr}" "${file}" \
+    > "${out_file}" 2> "${YQ_ERR_FILE}"; then
+    return 1
+  fi
+  house_rules::require_file "${out_file}"
+}
+
+# @description Decode a base64 field of an extract_run_steps record into the
+#              named variable. The value is kept up to the first NUL, trailing
+#              newlines included; it is used for display, and for a step id
+#              only when the record marks the id free of control characters.
+# @arg $1 result_var name of the variable to set
+# @arg $2 encoded base64 text, possibly empty
+function decode_field() {
+  local -n decoded_ref="$1"
+  local -r encoded="$2"
+  local -r field_file="${TMP_DIR}/field"
+  base64 --decode <<< "${encoded}" > "${field_file}" || house_rules::die "cannot decode '${encoded}'"
+  # read -d '' always reports end of input as status 1, so that status says
+  # nothing.
+  # shellcheck disable=SC2034 # set through the nameref; the caller reads it
+  IFS= read -r -d '' decoded_ref < "${field_file}" || true
+}
+
+# @description Store a human-readable identifier for a step in the named
+#              variable, used to report a step that has no YAML id to key an
+#              exemption on. Job and name print escaped onto one line.
+# @arg $1 result_var name of the variable to set
+# @arg $2 job job key, or `runs` for a composite action
+# @arg $3 index zero-based position of the step within its job
+# @arg $4 name the step's `name:`, possibly empty
+function step_label() {
+  local -n label_ref="$1"
+  local -r job="$2"
+  local -r index="$3"
+  local -r name="$4"
+  local shown_job shown_index shown_name
+  printable shown_job "${job}"
+  printable shown_index "${index}"
+  if [[ -z "${name}" ]]; then
+    label_ref="job '${shown_job}' step #${shown_index}"
+  else
+    printable shown_name "${name}"
+    # shellcheck disable=SC2034 # set through the nameref; the caller reads it
+    label_ref="job '${shown_job}' step #${shown_index} (${shown_name})"
+  fi
+}
+
+# @description Test whether a file holds a line exactly equal to the given
+#              text. A grep error dies rather than reading as "no such line",
+#              which would turn a stale-exemption check into a silent pass.
+# @arg $1 file the file to search
+# @arg $2 line the exact line to look for
+# @exitcode 0 the line is present
+# @exitcode 1 the line is absent
+function has_line() {
+  local -r file="$1"
+  local -r line="$2"
+  local status=0
+  grep --quiet --fixed-strings --line-regexp -- "${line}" "${file}" || status=$?
+  case "${status}" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) house_rules::die "cannot search ${file}" ;;
+  esac
+}
+
+# @description Write the repo-relative path of every `*.yml` and `*.yaml` file
+#              under the scan roots to out_file, NUL-separated and sorted. A
+#              missing root is skipped; a root find cannot fully list dies, so
+#              an unreadable directory never reads as "no files". Symlinks are
+#              followed, so a linked file or action directory is scanned, and
+#              a dangling link is listed for yq to reject.
+# @arg $1 out_file where to write the paths
+function list_scan_files() {
+  local -r out_file="$1"
+  local -r unsorted_file="${TMP_DIR}/files-unsorted"
+  local -r find_err_file="${TMP_DIR}/find-stderr"
+  : > "${unsorted_file}" || house_rules::die "cannot write ${unsorted_file}"
+  local root abs_root
+  for root in "${SCAN_ROOTS[@]}"; do
+    abs_root="${REPO_ROOT}/${root}"
+    if [[ ! -e "${abs_root}" && ! -L "${abs_root}" ]]; then
+      continue
+    fi
+    if ! find -L "${abs_root}" \( -type f -o -type l \) \( -name '*.yml' -o -name '*.yaml' \) \
+      -printf "${root}/%P\\0" >> "${unsorted_file}" 2> "${find_err_file}"; then
+      house_rules::die "cannot list ${root}: $(< "${find_err_file}")"
+    fi
+  done
+  sort --zero-terminated --output="${out_file}" -- "${unsorted_file}" || house_rules::die "cannot sort ${unsorted_file}"
+}
+
+# @description Check one scanned file against both rules, reporting each
+#              violation and recording each keyed run step in seen_file as
+#              `<key>|<1 if compliant, else 0>`.
+# @global REPO_ROOT the repo root
+# @arg $1 rel the file's repo-relative path
+# @arg $2 wrapper the wrapper a compliant run body names
+# @arg $3 seen_file where to append the keyed run steps
+# @arg $4 total_var name of the violation counter to increase
+# @stderr one line per violation
+function scan_file() {
+  local -r rel="$1"
+  local -r wrapper="$2"
+  local -r seen_file="$3"
+  local -n total_ref="$4"
+  local -r file="${REPO_ROOT}/${rel}"
+  local -r out_file="${TMP_DIR}/scan-out"
+  local -r steps_file="${TMP_DIR}/steps"
+  local shown_rel shown_wrapper
+  printable shown_rel "${rel}"
+  printable shown_wrapper "${wrapper}"
+
+  # Rule 2 on the raw text catches the spelling in a comment, which no YAML
+  # read sees. grep fails on a file it cannot read, which yq then reports as
+  # not valid YAML; one that yq reads but grep cannot dies below.
+  local grep_status=0 direct=0
+  grep --extended-regexp --quiet -- "${FORBIDDEN_PATTERN}" "${file}" 2> '/dev/null' || grep_status=$?
+  if ((grep_status == 0)); then
+    direct=1
+  fi
+
+  if ! HOUSE_RULES_FORBIDDEN_PATTERN="${FORBIDDEN_PATTERN}" \
+    scan_yq "${out_file}" "${DIRECT_SCALARS_EXPR}" "${file}"; then
+    if ((direct == 1)); then
+      printf '%s: spells "%s"; only %s may enter the devShell\n' "${shown_rel}" "${FORBIDDEN_SPELLING}" \
+        "${shown_wrapper}" >&2
+      total_ref=$((total_ref + 1))
+    fi
+    printf '%s: not valid YAML\n' "${shown_rel}" >&2
+    total_ref=$((total_ref + 1))
+    return 0
+  fi
+  if ((grep_status > 1)); then
+    house_rules::die "grep cannot read ${shown_rel}"
+  fi
+  local count
+  while IFS= read -r count; do
+    if [[ ! "${count}" =~ ^[0-9]+$ ]]; then
+      house_rules::die "unexpected scalar count '${count}' for ${shown_rel}"
+    fi
+    if ((count > 0)); then
+      direct=1
+    fi
+  done < "${out_file}"
+  if ((direct == 1)); then
+    printf '%s: spells "%s"; only %s may enter the devShell\n' "${shown_rel}" "${FORBIDDEN_SPELLING}" \
+      "${shown_wrapper}" >&2
+    total_ref=$((total_ref + 1))
+  fi
+
+  # TODO: the spec pins no message for a duplicate key in a scanned file; this
+  # one extends `not valid YAML`, since the YAML spec requires unique keys.
+  if ! scan_yq "${out_file}" "${WORKFLOW_DUPLICATE_KEYS_EXPR}" "${file}"; then
+    house_rules::die "yq failed on ${shown_rel} after parsing it: $(< "${YQ_ERR_FILE}")"
+  fi
+  local line
+  while IFS= read -r line; do
+    printf '%s: not valid YAML: %s\n' "${shown_rel}" "${line}" >&2
+    total_ref=$((total_ref + 1))
+  done < "${out_file}"
+
+  if ! HOUSE_RULES_WRAPPER="${wrapper}" scan_yq "${steps_file}" "${EXTRACT_RUN_STEPS_EXPR}" "${file}"; then
+    house_rules::die "yq failed on ${shown_rel} after parsing it: $(< "${YQ_ERR_FILE}")"
+  fi
+
+  local job_b64 index_b64 id_b64 id_unsafe name_b64 compliant extra
+  local job index id name key label shown_id
+  while IFS='|' read -r job_b64 index_b64 id_b64 id_unsafe name_b64 compliant extra; do
+    if [[ -n "${extra}" || ! "${id_unsafe}" =~ ^(true|false)$ || ! "${compliant}" =~ ^(true|false)$ ]]; then
+      house_rules::die "unexpected step record for ${shown_rel}"
+    fi
+    decode_field id "${id_b64}"
+    key=''
+    # A key holding a control character can match no exemption, and a newline
+    # in it would forge extra lines in seen_file.
+    if [[ -n "${id}" && "${id_unsafe}" == 'false' && "${rel}" != *[[:cntrl:]]* ]]; then
+      key="${rel}::${id}"
+      if [[ "${compliant}" == 'true' ]]; then
+        printf '%s|1\n' "${key}" >> "${seen_file}" || house_rules::die "cannot write ${seen_file}"
+      else
+        printf '%s|0\n' "${key}" >> "${seen_file}" || house_rules::die "cannot write ${seen_file}"
+      fi
+    fi
+    if [[ "${compliant}" == 'true' ]]; then
+      continue
+    fi
+    if [[ -n "${key}" && -n "${EXEMPT_STEPS["${key}"]+set}" ]]; then
+      continue
+    fi
+    if [[ -z "${id}" && "${id_unsafe}" == 'false' ]]; then
+      decode_field job "${job_b64}"
+      decode_field index "${index_b64}"
+      decode_field name "${name_b64}"
+      step_label label "${job}" "${index}" "${name}"
+      printf '%s: %s does not invoke %s and has no YAML id:; add one (%s exemptions are keyed <file>::<id>)\n' \
+        "${shown_rel}" "${label}" "${shown_wrapper}" "${HOUSE_RULES_CONFIG}" >&2
+    else
+      printable shown_id "${id}"
+      printf '%s::%s: run step does not invoke %s\n' "${shown_rel}" "${shown_id}" "${shown_wrapper}" >&2
+    fi
+    total_ref=$((total_ref + 1))
+  done < "${steps_file}"
+}
+
+# @description Report every exemption that covers no non-compliant run step:
+#              one naming no run step at all, or naming only steps that already
+#              use the wrapper. A key shared by a wrapped and an unwrapped step
+#              is still needed by the unwrapped one, so it is not stale.
+# @arg $1 exempt_file the exempt steps, one per line
+# @arg $2 seen_file the keyed run steps, as written by scan_file
+# @arg $3 wrapper the wrapper a compliant run body names
+# @arg $4 total_var name of the violation counter to increase
+# @stderr one line per stale exemption
+function report_stale() {
+  local -r exempt_file="$1"
+  local -r seen_file="$2"
+  local -r wrapper="$3"
+  local -n stale_total_ref="$4"
+  local shown_wrapper
+  printable shown_wrapper "${wrapper}"
+  house_rules::require_file "${exempt_file}"
+  local entry
+  while IFS= read -r entry; do
+    if has_line "${seen_file}" "${entry}|0"; then
+      continue
+    fi
+    if has_line "${seen_file}" "${entry}|1"; then
+      printf 'stale exemption in %s: %s already invokes %s\n' "${HOUSE_RULES_CONFIG}" "${entry}" \
+        "${shown_wrapper}" >&2
+    else
+      printf 'stale exemption in %s: %s matches no run step\n' "${HOUSE_RULES_CONFIG}" "${entry}" >&2
+    fi
+    stale_total_ref=$((stale_total_ref + 1))
+  done < "${exempt_file}"
+}
+
+# @description Validate the config, then scan every workflow and action file.
 # @noargs
 function main() {
   local -r section_file="${TMP_DIR}/section.json"
   local -r exempt_file="${TMP_DIR}/exempt"
+  local -r files_file="${TMP_DIR}/files"
+  local -r seen_file="${TMP_DIR}/seen"
   local errors=0 count=0
-  # shellcheck disable=SC2034 # set by validate_section; the workflow scan TODO below reads it
   local wrapper=''
 
   house_rules::load_config "${LINT}" "${REPO_ROOT}" "${section_file}" || count=$?
@@ -316,8 +670,27 @@ function main() {
     printf '%s %s error(s)\n' "${errors}" "${HOUSE_RULES_CONFIG}" >&2
     exit 1
   fi
-  # TODO: the workflow scan reads "${exempt_file}" and "${wrapper}"; until it
-  # lands, a valid config passes.
+
+  house_rules::require_file "${exempt_file}"
+  local entry
+  while IFS= read -r entry; do
+    EXEMPT_STEPS["${entry}"]=1
+  done < "${exempt_file}"
+
+  : > "${seen_file}" || house_rules::die "cannot write ${seen_file}"
+  list_scan_files "${files_file}"
+
+  local total=0 rel
+  while IFS= read -r -d '' rel; do
+    scan_file "${rel}" "${wrapper}" "${seen_file}" total
+  done < "${files_file}"
+
+  report_stale "${exempt_file}" "${seen_file}" "${wrapper}" total
+
+  if ((total > 0)); then
+    printf '%d hermetic-boundary violation(s)\n' "${total}" >&2
+    exit 1
+  fi
 }
 
 case "$#" in
