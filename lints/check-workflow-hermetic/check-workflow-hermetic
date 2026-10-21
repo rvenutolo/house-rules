@@ -69,42 +69,49 @@ function json_query() {
   result_ref="${result_ref%$'\n'}"
 }
 
-# @description Write the unique keys of a map in this lint's section, one per
-#              line. Keys come from the YAML file, never the section JSON: yq's
-#              JSON encoder drops a `<<` key even when it is quoted, and a key
-#              missing there would escape the unknown-key check.
+# @description Store a value in the named variable in a form that prints on one
+#              line: newline, carriage return and tab as `\n`, `\r` and `\t`,
+#              and any other control character as `?`, so user data cannot
+#              split or rewrite a message line.
+# @arg $1 result_var name of the variable to set
+# @arg $2 value the value to show
+function printable() {
+  local -n printable_ref="$1"
+  local value="$2"
+  value="${value//$'\n'/\\n}"
+  value="${value//$'\r'/\\r}"
+  value="${value//$'\t'/\\t}"
+  # shellcheck disable=SC2034 # set through the nameref; the caller reads it
+  printable_ref="${value//[[:cntrl:]]/?}"
+}
+
+# @description Report every key of a map in this lint's section that is not
+#              allowed. Keys come from the YAML file, never the section JSON:
+#              yq's JSON encoder drops a `<<` key even when it is quoted, and a
+#              key missing there would escape the check. The comparison runs
+#              inside yq and keys print escaped, so a key holding a newline can
+#              neither split into allowed names nor break a message line.
 # @global CONFIG_FILE the config file to read
 # @arg $1 sub_path yq path below the section, such as `.exempt[0]`; empty for
 #         the section itself
-# @arg $2 out_file where to write the keys
-function yaml_keys() {
-  local -r sub_path="$1"
-  local -r out_file="$2"
-  HOUSE_RULES_LINT="${LINT}" house_rules::yq "${out_file}" "${YQ_ERR_FILE}" \
-    ".[strenv(HOUSE_RULES_LINT)]${sub_path} | keys | unique | .[]" "${CONFIG_FILE}"
-}
-
-# @description Report every key of a map that is not in the allowed list.
-# @arg $1 keys_file the map's keys, one per line
 # @arg $2 prefix what to put before `unknown key '<k>'`
-# @arg $@ allowed the allowed keys, after the first two arguments
+# @arg $3 allowed the allowed keys, comma-separated
+# @arg $4 scratch_file a file to use as scratch space
 # @stderr one section error per unknown key
 # @exitcode * the number of unknown keys, capped at 255
 function report_unknown_keys() {
-  local -r keys_file="$1"
+  local -r sub_path="$1"
   local -r prefix="$2"
-  shift 2
-  house_rules::require_file "${keys_file}"
-  local errors=0 key allowed_key
+  local -r allowed="$3"
+  local -r scratch_file="$4"
+  HOUSE_RULES_LINT="${LINT}" HOUSE_RULES_ALLOWED="${allowed}" house_rules::yq "${scratch_file}" "${YQ_ERR_FILE}" \
+    ".[strenv(HOUSE_RULES_LINT)]${sub_path} | ${HOUSE_RULES_UNKNOWN_KEYS_EXPR}" "${CONFIG_FILE}"
+  house_rules::require_file "${scratch_file}"
+  local errors=0 key
   while IFS= read -r key; do
-    for allowed_key in "$@"; do
-      if [[ "${key}" == "${allowed_key}" ]]; then
-        continue 2
-      fi
-    done
     section_error "${prefix}unknown key '${key}'"
     errors=$((errors + 1))
-  done < "${keys_file}"
+  done < "${scratch_file}"
   house_rules::return_count "${errors}"
 }
 
@@ -132,8 +139,7 @@ function validate_entry() {
     return 1
   fi
 
-  yaml_keys "${entry}" "${out_step_file}"
-  report_unknown_keys "${out_step_file}" "${where}: " 'step' 'reason' || count=$?
+  report_unknown_keys "${entry}" "${where}: " 'step,reason' "${out_step_file}" || count=$?
   errors=$((errors + count))
   : > "${out_step_file}" || house_rules::die "cannot write ${out_step_file}"
 
@@ -148,15 +154,17 @@ function validate_entry() {
       json_query step "${section_file}" "${entry}.step"
       # Exactly one `::`: splitting at the first and at the last occurrence
       # must agree, which also rejects an overlapping `:::`. Neither part may
-      # be blank. A newline would split the one-step-per-line exempt file.
+      # be blank. A control character never appears in a real step key, and a
+      # newline would split the one-step-per-line exempt file.
       local -r file_part="${step%%::*}"
       local -r id_part="${step#*::}"
       if [[ "${step}" == *::* && "${file_part}" == "${step%::*}" && -n "${file_part//[[:space:]]/}" &&
-        -n "${id_part//[[:space:]]/}" && "${step}" != *$'\n'* ]]; then
+        -n "${id_part//[[:space:]]/}" && "${step}" != *[[:cntrl:]]* ]]; then
         step_ok=1
       else
-        # Newlines shown as `\n` so the message stays on one line.
-        section_error "${where}: step '${step//$'\n'/\\n}' is not <file>::<id>"
+        local shown_step
+        printable shown_step "${step}"
+        section_error "${where}: step '${shown_step}' is not <file>::<id>"
         errors=$((errors + 1))
       fi
       ;;
@@ -194,7 +202,7 @@ function validate_entry() {
 
 # @description Validate this lint's section of `.house-rules.yml`, as written
 #              by house_rules::load_config, and extract its settings. Values
-#              come from the JSON; key lists come from the YAML file.
+#              come from the JSON; key checks read the YAML file.
 # @global CONFIG_FILE the config file, for key lists
 # @arg $1 section_json_file the section as JSON; `null` means no section
 # @arg $2 out_exempt_file where to write each valid exempt step, one per line
@@ -223,8 +231,7 @@ function validate_section() {
       ;;
   esac
 
-  yaml_keys '' "${scratch_file}"
-  report_unknown_keys "${scratch_file}" '' 'wrapper' 'exempt' || count=$?
+  report_unknown_keys '' '' 'wrapper,exempt' "${scratch_file}" || count=$?
   errors=$((errors + count))
 
   # A key given with no value is null. It counts as the wrong type, not as

@@ -28,24 +28,53 @@ readonly HOUSE_RULES_MAX_STATUS=255
 #   inside a yq string. Each `'"'"'` ends the shell quote, adds a literal single
 #   quote and reopens it.
 
-# yq fragment turning a path array into a `where`: `section.key[index]`, or
-# `top level` for the root.
-readonly HOUSE_RULES_WHERE_EXPR='(map(select(tag == "!!int") |= "[" + tostring + "]") | join(".")
-  | sub("\.\[", "[") | sub("^$", "top level"))'
+# yq fragment printing a value, a key in particular, on one line: JSON string
+# escaping without the surrounding quotes, so `a<newline>b` prints as `a\nb`.
+# Keys are user data, and a raw newline in one would split a one-per-line
+# listing into names that look allowed; a raw carriage return would garble the
+# terminal line.
+readonly HOUSE_RULES_ESCAPE_EXPR='(tostring | @json | sub("^.", "") | sub(".$", ""))'
 
-# yq expression listing every merge key (`<<`) and every alias anywhere in the
-# file, one message each. Converting to JSON resolves both silently: an inline
-# merge can add an unknown key or override `step` unseen, so neither may reach
-# that conversion.
+# yq fragment turning a path array into a `where`: `section.key[index]`, with
+# keys escaped, or `top level` for the root.
+readonly HOUSE_RULES_WHERE_EXPR='(map(select(tag == "!!str") |= "." + '"${HOUSE_RULES_ESCAPE_EXPR}"')
+  | map(select(tag == "!!int") |= "[" + tostring + "]") | join("") | sub("^\.", "") | sub("^$", "top level"))'
+
+# yq fragment, applied to a tag string, that is true for a YAML core tag. Any
+# other tag is lost in the JSON conversion, so `!custom wrapper: x` would set
+# the wrapper unseen.
+readonly HOUSE_RULES_CORE_TAG_EXPR='(. == "!!map" or . == "!!seq" or . == "!!str" or . == "!!null" or . == "!!int"
+  or . == "!!bool" or . == "!!float")'
+
+# yq expression listing every construct the JSON conversion would silently
+# rewrite, anywhere in the file, one message each: merge keys (`<<`), aliases,
+# and tags other than the core ones, on keys or on values. An inline merge can
+# add an unknown key or override `step` unseen, so none may reach that
+# conversion.
 # shellcheck disable=SC2016 # $p is a yq variable, not a shell one
-readonly HOUSE_RULES_MERGE_ALIAS_EXPR='
+readonly HOUSE_RULES_UNSUPPORTED_EXPR='
 ([.. | select(type == "!!map") | {"path": path, "merges": [keys | .[] | select(tag == "!!merge")]}]
   | map(.path as $p | .merges | map($p)) | flatten(1) | .[]
   | '"${HOUSE_RULES_WHERE_EXPR}"'
   | "merge key '"'"'<<'"'"' is not supported (in " + . + ")"),
 (.. | select(kind == "alias")
-  | "YAML alias '"'"'*" + alias + "'"'"' is not supported (in " + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")")
+  | "YAML alias '"'"'*" + (alias | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
+    + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")"),
+([.. | select(type == "!!map") | {"path": path, "tags": [keys | .[] | tag
+    | select(. != "!!merge") | select('"${HOUSE_RULES_CORE_TAG_EXPR}"' | not)]}]
+  | map(.path as $p | .tags | map({"path": $p, "tag": .})) | flatten(1) | .[]
+  | "YAML tag '"'"'" + (.tag | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
+    + (.path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")"),
+(.. | select(kind != "alias") | select(tag | '"${HOUSE_RULES_CORE_TAG_EXPR}"' | not)
+  | "YAML tag '"'"'" + (tag | '"${HOUSE_RULES_ESCAPE_EXPR}"') + "'"'"' is not supported (in "
+    + (path | '"${HOUSE_RULES_WHERE_EXPR}"') + ")")
 '
+
+# yq expression listing, escaped and one per line, every key of the map it is
+# given that is not in the comma-separated HOUSE_RULES_ALLOWED environment
+# variable. The comparison happens inside yq, on the keys themselves.
+readonly HOUSE_RULES_UNKNOWN_KEYS_EXPR='(keys | unique) - (strenv(HOUSE_RULES_ALLOWED) | split(","))
+  | .[] | '"${HOUSE_RULES_ESCAPE_EXPR}"
 
 # yq expression listing every duplicate mapping key at the top level and inside
 # the section named by the HOUSE_RULES_LINT environment variable, one message
@@ -58,7 +87,7 @@ readonly HOUSE_RULES_DUPLICATE_KEYS_EXPR='
 | select((keys | length) > (keys | unique | length))
 | (path | '"${HOUSE_RULES_WHERE_EXPR}"') as $where
 | keys | group_by(.) | map(select(length > 1) | .[0]) | .[]
-| "duplicate key '"'"'" + tostring + "'"'"' in " + $where
+| "duplicate key '"'"'" + '"${HOUSE_RULES_ESCAPE_EXPR}"' + "'"'"' in " + $where
 '
 
 # @description Print `<script-name>: <message>` to stderr and exit 1. Inside a
@@ -122,10 +151,11 @@ function house_rules::require_file() {
 
 # @description Validate the file level of `<repo_root>/.house-rules.yml` and
 #              write the lint's section to out_file as JSON. File level means:
-#              it parses, holds one document, uses no merge key or alias, its
-#              top level is a map, every top-level key is a known lint, and no
-#              map at the top level or in the lint's section repeats a key. The
-#              section's own schema is the lint's to check. out_file gets
+#              it parses, holds one document, uses no merge key, alias or
+#              non-core tag, its top level is a map, every top-level key is a
+#              known lint, and no map at the top level or in the lint's section
+#              repeats a key. The section's own schema is the lint's to check.
+#              Every key in a message is escaped onto one line. out_file gets
 #              `null` when there is no file, the file is empty, or the section
 #              is missing or empty, and also when the file is too broken to
 #              read a section from. out_file and `<out_file>.stderr` double as
@@ -169,8 +199,8 @@ function house_rules::load_config() {
   local line
 
   # Checked before anything else reads the file, and fatal: every later read
-  # would see the merged or aliased content instead of what was written.
-  house_rules::yq "${out_file}" "${err_file}" "${HOUSE_RULES_MERGE_ALIAS_EXPR}" "${config_file}"
+  # would see merged, aliased or untagged content instead of what was written.
+  house_rules::yq "${out_file}" "${err_file}" "${HOUSE_RULES_UNSUPPORTED_EXPR}" "${config_file}"
   house_rules::require_file "${out_file}"
   while IFS= read -r line; do
     house_rules::config_error "${line}"
@@ -206,19 +236,15 @@ function house_rules::load_config() {
     errors=$((errors + 1))
   done < "${out_file}"
 
-  # `unique` so a duplicated unknown key is reported once here; the duplicate
-  # itself is reported above.
-  house_rules::yq "${out_file}" "${err_file}" 'keys | unique | .[]' "${config_file}"
-  house_rules::require_file "${out_file}"
-  local known known_list
+  local known_list allowed
   printf -v known_list '%s, ' "${HOUSE_RULES_LINTS[@]}"
   known_list="${known_list%, }"
+  printf -v allowed '%s,' "${HOUSE_RULES_LINTS[@]}"
+  allowed="${allowed%,}"
+  HOUSE_RULES_ALLOWED="${allowed}" house_rules::yq "${out_file}" "${err_file}" \
+    "${HOUSE_RULES_UNKNOWN_KEYS_EXPR}" "${config_file}"
+  house_rules::require_file "${out_file}"
   while IFS= read -r line; do
-    for known in "${HOUSE_RULES_LINTS[@]}"; do
-      if [[ "${line}" == "${known}" ]]; then
-        continue 2
-      fi
-    done
     house_rules::config_error "unknown lint '${line}'; known: ${known_list}"
     errors=$((errors + 1))
   done < "${out_file}"
