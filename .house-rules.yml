@@ -1,0 +1,8 @@
+check-workflow-hermetic:
+  exempt:
+    - step: .github/actions/setup/action.yml::root-devshell
+      reason: >-
+        It creates the GC roots that the cache save honours. It must use the nix the installer put on PATH, outside the devShell whose closure it roots.
+    - step: .github/workflows/ci.yml::verdict
+      reason: >-
+        It only compares the needed jobs' results. Installing Nix for it would add a devShell setup to every PR.

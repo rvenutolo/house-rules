@@ -55,10 +55,5 @@
     };
   };
 
-  settings.global.excludes = [
-    "flake.lock"
-    # Managed centrally by tofu-github-repos; yamlfmt would strip its blank
-    # lines and make it drift from the pushed copy.
-    ".github/workflows/merge-gate.yml"
-  ];
+  settings.global.excludes = [ "flake.lock" ];
 }

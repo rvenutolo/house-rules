@@ -1,0 +1,113 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions: {}
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >-
+            api.github.com:443 cache.nixos.org:443 channels.nixos.org:443 codeload.github.com:443 github.com:443 hosted-compute-*.githubapp.com:443 install.determinate.systems:443 nixos.org:443 objects.githubusercontent.com:443 raw.githubusercontent.com:443 releases.nixos.org:443 tarballs.nixos.org:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # `$/` waits on actionlint support; this job runs its own commit, so `./` is the same tree.
+      - uses: ./.github/actions/setup # zizmor: ignore[self-repository]
+      - name: Run the gate
+        run: ./.ci/in-devshell ./run-all-checks
+  commitlint:
+    name: commitlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >-
+            api.github.com:443 cache.nixos.org:443 channels.nixos.org:443 codeload.github.com:443 github.com:443 hosted-compute-*.githubapp.com:443 install.determinate.systems:443 nixos.org:443 objects.githubusercontent.com:443 raw.githubusercontent.com:443 releases.nixos.org:443 tarballs.nixos.org:443
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # `$/` waits on actionlint support; this job runs its own commit, so `./` is the same tree.
+      - uses: ./.github/actions/setup # zizmor: ignore[self-repository]
+      - name: Run commitlint
+        id: commitlint
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          # The range arrives through env: rather than interpolated into this
+          # body, which would be the template-injection sink zizmor audits for.
+          if [[ "${GITHUB_EVENT_NAME}" == 'pull_request' ]]; then
+            from="${PR_BASE_SHA}"
+            to="${PR_HEAD_SHA}"
+          else
+            from="${PUSH_BEFORE_SHA}"
+            to="${GITHUB_SHA}"
+          fi
+          # An all-zero before-SHA means the ref did not exist prior to this
+          # push, so there is no range to walk; lint the tip commit alone.
+          if [[ "${from}" =~ ^0+$ ]]; then
+            ./.ci/in-devshell commitlint --last --verbose
+          else
+            ./.ci/in-devshell commitlint --from "${from}" --to "${to}" --verbose
+          fi
+  # The one check the protect-main ruleset requires. Every other job feeds it
+  # through `needs`, so jobs can be added, split or renamed here without
+  # editing the ruleset. always(): without it a failed or cancelled dependency
+  # would skip this job, and a skipped required check counts as passing.
+  # No Nix: it only reads the needed jobs' results.
+  ci-ok:
+    name: ci-ok
+    needs: [gate, commitlint]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: block
+          disable-sudo-and-containers: true
+          allowed-endpoints: >-
+            api.github.com:443 github.com:443
+      - id: verdict
+        env:
+          GATE_RESULT: ${{ needs.gate.result }}
+          COMMITLINT_RESULT: ${{ needs.commitlint.result }}
+        run: |
+          set -Eeuo pipefail
+          IFS=$'\n\t'
+          # Anything but success or skipped fails, an empty result included, so
+          # a job renamed in `needs` but not here cannot pass unseen.
+          rc=0
+          for job_result in "gate=${GATE_RESULT}" "commitlint=${COMMITLINT_RESULT}"; do
+            case "${job_result#*=}" in
+              success | skipped) ;;
+              *)
+                printf '%s did not succeed (%s)\n' "${job_result%%=*}" "${job_result#*=}" >&2
+                rc=1
+                ;;
+            esac
+          done
+          exit "${rc}"

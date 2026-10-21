@@ -1,0 +1,72 @@
+name: setup
+# Caller must run harden-runner (step 0) and actions/checkout (step 1) before
+# this composite: a local action cannot perform its own initial checkout (the
+# runner needs the repo on disk to load this file).
+description: Install Nix, restore the Nix store cache, and GC-root the devShell closure so the saved cache holds only that closure.
+runs:
+  using: composite
+  steps:
+    - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+    # The key hashes this file as well as flake.lock, so a change to how the
+    # store is rooted or collected saves under a fresh key. A primary-key hit
+    # skips the save, GC included, so without the salt an existing oversized
+    # archive would keep restoring unchanged.
+    #
+    # gc-max-store-size-linux 0 collects every path not reachable from a GC
+    # root just before the save. The root-devshell step below is what keeps
+    # the devShell's closure out of that collection; without it the saved
+    # archive would be near empty and every job would re-download the closure.
+    - uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+      with:
+        primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock', '.github/actions/setup/action.yml') }}
+        restore-prefixes-first-match: nix-${{ runner.os }}-
+        gc-max-store-size-linux: 0
+    # Runs on the bare runner, not through .ci/in-devshell: it creates the GC
+    # roots that the cache action's post-job save honours, and it uses only the
+    # nix that nix-installer-action just put on PATH.
+    #
+    # inputDerivation references every package the devShell provides, so its
+    # closure is exactly what `.ci/in-devshell` needs at runtime. The flake
+    # inputs and the repo's own source snapshot (`self`) are rooted too, since
+    # evaluating the flake needs their sources and re-fetching nixpkgs in every
+    # job would cost more than storing it.
+    #
+    # Entering the devShell also needs two things outside that closure: the
+    # flake's nixpkgs bashInteractive with all its default outputs (`man`
+    # included), and the nix-shell-env derivation built from the devShell.
+    # Rooting both keeps devShell entry free of downloads and builds on a warm
+    # cache. The shell env is rooted through `nix print-dev-env --profile`,
+    # because only `.ci/in-devshell` may enter the devShell.
+    #
+    # The formatting check's own output is built from `self`, so it changes on
+    # every commit and caching it buys nothing; its inputDerivation is rooted
+    # instead, so `nix flake check` finds treefmt, the formatters, and the
+    # check's build tools already in the store.
+    #
+    # The attribute paths hard-code x86_64-linux because every caller runs on
+    # ubuntu-latest, which is x86_64. The cache key's runner.os names only the
+    # OS, not the architecture, so it cannot be substituted here.
+    - id: root-devshell
+      shell: bash
+      run: |
+        set -Eeuo pipefail
+        IFS=$'\n\t'
+        nix build '.#devShells.x86_64-linux.default.inputDerivation' --out-link "${RUNNER_TEMP}/gcroots/devshell"
+        nix build --inputs-from . 'nixpkgs#bashInteractive' --out-link "${RUNNER_TEMP}/gcroots/bash-interactive"
+        nix print-dev-env --profile "${RUNNER_TEMP}/gcroots/shell-env" > /dev/null
+        nix build '.#checks.x86_64-linux.formatting.inputDerivation' --out-link "${RUNNER_TEMP}/gcroots/formatting-check"
+        # The store paths are pulled out of the JSON with bash's own regex
+        # matching, so the step depends on nothing the runner image happens to
+        # ship.
+        archive="$(nix flake archive --json)"
+        path_re='"path":"(/nix/store/[^"]+)"'
+        inputs=()
+        while [[ "${archive}" =~ ${path_re} ]]; do
+          inputs+=("${BASH_REMATCH[1]}")
+          archive="${archive#*"${BASH_REMATCH[0]}"}"
+        done
+        if ((${#inputs[@]} == 0)); then
+          printf 'setup: nix flake archive reported no input paths\n' >&2
+          exit 1
+        fi
+        nix-store --add-root "${RUNNER_TEMP}/gcroots/flake-input" --realise "${inputs[@]}" > /dev/null
