@@ -539,6 +539,47 @@ EOF
 EOF
 }
 
+@test 'fails: quoted << key in the section' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  "<<": {bogus: 1}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: check-workflow-hermetic: unknown key '<<'
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: quoted << key in an entry' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - {step: a.yml::x, reason: r, "<<": {step: b.yml::y}}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: check-workflow-hermetic: exempt[0]: unknown key '<<'
+1 .house-rules.yml error(s)
+EOF
+}
+
+@test 'fails: !!str << key in an entry' {
+  write_config << 'EOF'
+check-workflow-hermetic:
+  exempt:
+    - {step: a.yml::x, reason: r, !!str <<: {step: b.yml::y}}
+EOF
+  run --separate-stderr check-workflow-hermetic
+  assert_failure 1
+  assert_stderr - << 'EOF'
+.house-rules.yml: check-workflow-hermetic: exempt[0]: unknown key '<<'
+1 .house-rules.yml error(s)
+EOF
+}
+
 @test 'reports every config error in one run' {
   write_config << 'EOF'
 check-workflow-hermetic:
