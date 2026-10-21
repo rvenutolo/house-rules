@@ -83,19 +83,21 @@ readonly HOUSE_RULES_UNSUPPORTED_EXPR='
 readonly HOUSE_RULES_UNKNOWN_KEYS_EXPR='(keys | unique) - (strenv(HOUSE_RULES_ALLOWED) | split(","))
   | .[] | '"${HOUSE_RULES_ESCAPE_EXPR}"
 
-# yq expression listing every duplicate mapping key at the top level and inside
-# the section named by the HOUSE_RULES_LINT environment variable, one message
-# per key. yq-go keeps only the last of a duplicated key, so the duplicate is
-# invisible to every later read.
+# yq fragment, applied to a stream of nodes, listing every duplicate mapping key
+# among them, one message per key. yq-go keeps only the last of a duplicated
+# key, so the duplicate is invisible to every later read.
 # shellcheck disable=SC2016 # $where is a yq variable, not a shell one
-readonly HOUSE_RULES_DUPLICATE_KEYS_EXPR='
-(., (.[strenv(HOUSE_RULES_LINT)] | ..))
-| select(kind == "map")
+readonly HOUSE_RULES_DUPLICATE_KEYS_FRAGMENT='
+select(kind == "map")
 | select((keys | length) > (keys | unique | length))
 | (path | '"${HOUSE_RULES_WHERE_EXPR}"') as $where
 | keys | group_by(.) | map(select(length > 1) | .[0]) | .[]
 | "duplicate key '"'"'" + '"${HOUSE_RULES_ESCAPE_EXPR}"' + "'"'"' in " + $where
 '
+
+# yq expression listing every duplicate mapping key at the top level and inside
+# the section named by the HOUSE_RULES_LINT environment variable.
+readonly HOUSE_RULES_DUPLICATE_KEYS_EXPR='(., (.[strenv(HOUSE_RULES_LINT)] | ..)) | '"${HOUSE_RULES_DUPLICATE_KEYS_FRAGMENT}"
 
 # @description Print `<script-name>: <message>` to stderr and exit 1. Inside a
 #              command substitution it exits only that subshell, so callers
@@ -156,7 +158,7 @@ function house_rules::require_file() {
   [[ -f "${file}" ]] || house_rules::die "missing ${file}"
 }
 
-# @description Validate the file level of `<repo_root>/.house-rules.yml` and
+# @description Validate the file level of the repo's `.house-rules.yml` and
 #              write the lint's section to out_file as JSON. File level means:
 #              it parses, holds one document, uses no merge key, alias or
 #              non-core tag, its top level is a map, every top-level key is a
@@ -168,17 +170,16 @@ function house_rules::require_file() {
 #              read a section from. out_file and `<out_file>.stderr` double as
 #              scratch space while validating.
 # @arg $1 lint the lint whose section to extract
-# @arg $2 repo_root absolute path of the repo root
+# @arg $2 config_file absolute path of the repo's config file; it need not exist
 # @arg $3 out_file where to write the section as JSON
 # @stderr one `.house-rules.yml: <problem>` line per file-level error
 # @exitcode 0 the file level is valid
 # @exitcode * the number of file-level errors, capped at 255
 function house_rules::load_config() {
   local -r lint="$1"
-  local -r repo_root="$2"
+  local -r config_file="$2"
   local -r out_file="$3"
   local -r err_file="${out_file}.stderr"
-  local -r config_file="${repo_root}/${HOUSE_RULES_CONFIG}"
 
   # A dangling symlink is not "no file": it goes on to yq, which reports it.
   if [[ ! -e "${config_file}" && ! -L "${config_file}" ]]; then
