@@ -90,17 +90,10 @@ readonly FORBIDDEN_PATTERN="(^|[^[:alnum:]_-])${NIX_WORD}${FORBIDDEN_GAP}${DEVEL
 readonly DIRECT_SCALARS_EXPR='[.. | select(kind == "scalar") | tostring
   | select(test(strenv(HOUSE_RULES_FORBIDDEN_PATTERN)))] | length'
 
-# yq expression listing every duplicate mapping key anywhere in a document, one
-# message per key. yq keeps only the last of a duplicated key, so a duplicated
-# `jobs` or `run` would hide the first value from every later read.
-# shellcheck disable=SC2016 # $where is a yq variable, not a shell one
-readonly WORKFLOW_DUPLICATE_KEYS_EXPR='
-.. | select(kind == "map")
-| select((keys | length) > (keys | unique | length))
-| (path | '"${HOUSE_RULES_WHERE_EXPR}"') as $where
-| keys | group_by(.) | map(select(length > 1) | .[0]) | .[]
-| "duplicate key '"'"'" + '"${HOUSE_RULES_ESCAPE_EXPR}"' + "'"'"' in " + $where
-'
+# yq expression listing every duplicate mapping key anywhere in a document. A
+# duplicated `jobs` or `run` would otherwise hide the first value from every
+# later read.
+readonly WORKFLOW_DUPLICATE_KEYS_EXPR='.. | '"${HOUSE_RULES_DUPLICATE_KEYS_FRAGMENT}"
 
 # yq expression emitting one record per step that carries a `run:` key, for
 # both the workflow (`.jobs[].steps[]`) and composite-action (`.runs.steps[]`)
@@ -711,6 +704,10 @@ function report_stale() {
 }
 
 # @description Validate the config, then scan every workflow and action file.
+# @global LINT the section of the config this lint reads
+# @global CONFIG_FILE the config file to validate
+# @global TMP_DIR the run's scratch directory
+# @global EXEMPT_STEPS filled with the exempt step keys
 # @noargs
 function main() {
   local -r section_file="${TMP_DIR}/section.json"
@@ -720,7 +717,7 @@ function main() {
   local errors=0 count=0
   local wrapper=''
 
-  house_rules::load_config "${LINT}" "${REPO_ROOT}" "${section_file}" || count=$?
+  house_rules::load_config "${LINT}" "${CONFIG_FILE}" "${section_file}" || count=$?
   errors=$((errors + count))
   count=0
   validate_section "${section_file}" "${exempt_file}" wrapper || count=$?
