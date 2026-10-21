@@ -1842,7 +1842,7 @@ EOF
 
 @test 'fails: a custom tag on the document root' {
   write_fixture .github/workflows/a.yml << 'EOF'
---- !x
+!x
 on: push
 jobs:
   build:
