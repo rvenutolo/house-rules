@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+
+# @description Point this clone's core.hooksPath at the tracked .githooks
+#              directory so the repo's commit-msg and pre-push hooks fire.
+#              Repo-local git config cannot be committed, so without this the
+#              hooks sit inert. The flake devShell's shellHook calls it, which
+#              makes entering the shell the one onboarding step nobody skips.
+#              Idempotent and silent once the value is correct, because it runs
+#              on every shell entry. A foreign core.hooksPath is overwritten
+#              and logged: leaving it would mean silently inert hooks.
+#
+#              Standalone on purpose: it runs from the shellHook, including
+#              under `nix develop --ignore-environment`, so it depends on
+#              nothing but bash and git.
+# @noargs
+# @stderr One line naming the change, on the runs that change something.
+# @exitcode 0 the tracked hooks are active, already or as of this run.
+# @exitcode 1 the working directory is not inside a git repo, or an argument was given.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+
+# Repo-root-relative on purpose: git resolves core.hooksPath against the work
+# tree root, so one value is correct for every clone and every machine.
+readonly HOOKS_PATH='.githooks'
+
+# @description Set core.hooksPath to HOOKS_PATH unless it already is.
+# @noargs
+function main() {
+  local current
+  local status=0
+  # `--get` exits 1 when the key is unset, the ordinary first-run case. Any
+  # other non-zero exit (corrupt config, unreadable file) is a real failure.
+  current="$(git -C "${REPO_ROOT}" config --local --get core.hooksPath)" || status=$?
+  case "${status}" in
+    0) ;;
+    1) current='' ;;
+    *)
+      printf '%s: could not read core.hooksPath (git exit %s)\n' "${0##*/}" "${status}" >&2
+      exit "${status}"
+      ;;
+  esac
+  if [[ "${current}" == "${HOOKS_PATH}" ]]; then
+    return 0
+  fi
+  git -C "${REPO_ROOT}" config --local core.hooksPath "${HOOKS_PATH}"
+  if [[ -z "${current}" ]]; then
+    printf '%s: activated the tracked git hooks: core.hooksPath set to %s\n' \
+      "${0##*/}" "${HOOKS_PATH}" >&2
+  else
+    printf '%s: repointed core.hooksPath from %s to %s\n' \
+      "${0##*/}" "${current}" "${HOOKS_PATH}" >&2
+  fi
+}
+
+if (($# > 0)); then
+  printf '%s: expected no arguments, got %s\n' "${0##*/}" "$#" >&2
+  exit 1
+fi
+if ! REPO_ROOT="$(git rev-parse --show-toplevel 2> '/dev/null')"; then
+  printf '%s: not a git repo: %s\n' "${0##*/}" "$(pwd)" >&2
+  exit 1
+fi
+readonly REPO_ROOT
+
+main "$@"

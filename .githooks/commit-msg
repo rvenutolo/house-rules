@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+# @description Git commit-msg hook: validates the message against the
+#              Conventional Commits rules in .commitlintrc.yml. Uses the
+#              commitlint on the ambient PATH, which is the devShell's when the
+#              shell is entered through direnv or `nix develop`.
+# @arg $1 message_file path to the commit message file, supplied by git
+# @exitcode 0 the message is valid.
+# @exitcode 1 commitlint is not on PATH, or the message is invalid.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+
+# @description Validate the commit message with commitlint.
+# @arg $1 message_file path to the commit message file
+function main() {
+  local -r message_file="$1"
+  commitlint --edit "${message_file}"
+}
+
+if ! command -v commitlint > '/dev/null' 2>&1; then
+  printf 'commit-msg: commitlint not found on PATH; enter the devShell (nix develop)\n' >&2
+  exit 1
+fi
+
+main "$@"

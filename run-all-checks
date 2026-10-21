@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+
+# @description The full verification gate, verify-only: formatting (nix flake
+#              check), the lint suite and the BATS suite. Exit codes aggregate,
+#              so one run surfaces every failing category. Every caller (the
+#              pre-push hook, the .justfile and CI) runs it through
+#              .ci/in-devshell, so local and CI runs cannot drift.
+# @noargs
+# @exitcode 0 every check passed.
+# @exitcode 1 one or more checks failed.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+
+# bash 4.4 for `inherit_errexit`; the devShell's bash always satisfies this.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  printf '%s: bash 4.4+ required (found %s.%s)\n' "${0##*/}" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" >&2
+  exit 1
+fi
+shopt -s inherit_errexit
+
+# Scratch file for command output (no process substitution). A script-level
+# variable, not a local: the single-quoted EXIT trap expands it at exit, after
+# any function's locals are gone.
+TMP_FILE="$(mktemp)"
+readonly TMP_FILE
+trap 'rm --force -- "${TMP_FILE}"' EXIT
+
+# @description Write a timestamped, levelled line to stderr.
+# @arg $1 level severity label
+# @arg $2 message text to print
+function log() {
+  local -r level="$1"
+  local -r message="$2"
+  printf '[%s] %-5s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${level}" "${message}" >&2
+}
+
+# @description Write an INFO line to stderr.
+# @arg $@ message text to print
+function log_info() {
+  log INFO "$*"
+}
+
+# @description Write a WARN line to stderr.
+# @arg $@ message text to print
+function log_warn() {
+  log WARN "$*"
+}
+
+# @description Write an ERROR line to stderr.
+# @arg $@ message text to print
+function log_err() {
+  log ERROR "$*"
+}
+
+# @description Warn about untracked files. `nix flake check` evaluates the git
+#              tree, so an untracked file is invisible to the formatting gate
+#              and passes vacuously. Warns, never fails.
+# @noargs
+function warn_untracked() {
+  git ls-files --others --exclude-standard > "${TMP_FILE}"
+  if [[ ! -s "${TMP_FILE}" ]]; then
+    return 0
+  fi
+  log_warn 'untracked files are invisible to nix flake check; git add them:'
+  local untracked_file
+  while IFS= read -r untracked_file; do
+    log_warn "  untracked: ${untracked_file}"
+  done < "${TMP_FILE}"
+}
+
+# @description Run every check and aggregate the exit codes.
+# @noargs
+function main() {
+  local rc=0
+  warn_untracked
+
+  log_info 'running nix flake check (formatting)'
+  nix flake check --no-eval-cache "${REPO_DIR}" || rc=1
+
+  log_info 'running lint checks'
+  "${REPO_DIR}/.ci/run-lint-checks" || rc=1
+
+  log_info 'running tests'
+  "${REPO_DIR}/run-tests" || rc=1
+
+  if ((rc != 0)); then
+    log_err 'one or more checks failed'
+  fi
+  # A gate reporting its own verdict is not a crash: drop the ERR trap so the
+  # diagnostics above are the last thing the reader sees.
+  trap - ERR
+  return "${rc}"
+}
+
+REPO_DIR="$(git rev-parse --show-toplevel)"
+readonly REPO_DIR
+cd "${REPO_DIR}" || exit 1
+
+main "$@"

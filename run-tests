@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+# @description Run the BATS suite. With no arguments, runs every test under
+#              test/; otherwise forwards its arguments to bats verbatim.
+# @arg $@ args Optional bats arguments or test paths.
+# @exitcode 0 all tests passed.
+# @exitcode 1 bats is not on PATH.
+# @exitcode * otherwise bats' exit status.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+
+# @description Run bats with the default target or the caller's arguments.
+# @arg $@ args Optional bats arguments or test paths.
+function main() {
+  if (($# == 0)); then
+    exec bats --recursive test/
+  fi
+  exec bats "$@"
+}
+
+if ! command -v bats > '/dev/null' 2>&1; then
+  printf '%s: bats not found on PATH; run ./.ci/in-devshell ./run-tests\n' "${0##*/}" >&2
+  exit 1
+fi
+REPO_DIR="$(git rev-parse --show-toplevel)"
+readonly REPO_DIR
+cd "${REPO_DIR}" || exit 1
+
+main "$@"

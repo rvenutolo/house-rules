@@ -1,0 +1,12 @@
+extends: default
+rules:
+  document-start: disable
+  # harden-runner's `allowed-endpoints` lists have to be one space-separated
+  # line and cannot be wrapped: a folded scalar is collapsed back onto a single
+  # line by the formatter, and a literal block is parsed as one giant endpoint.
+  line-length:
+    max: 600
+  truthy:
+    check-keys: false
+  comments:
+    min-spaces-from-content: 1

@@ -1,0 +1,4 @@
+config:
+  # The repo wraps prose at 120 columns, matching its other files.
+  MD013:
+    line_length: 120
