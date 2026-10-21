@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+
+# @description Assert that every GitHub Actions step which runs a command runs
+#              it inside the repo's hermetic Nix devShell wrapper. Reads its
+#              exemptions and wrapper path from the `check-workflow-hermetic`
+#              section of `.house-rules.yml` at the repo root, and fails on any
+#              error in that file before scanning anything.
+# @arg $1 --help print usage and exit
+# @stdout the usage line, with --help
+# @stderr one line per config error, then `<N> .house-rules.yml error(s)`
+# @exitcode 0 the config is valid
+# @exitcode 1 a config error, an unexpected argument, or not inside a git repository
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+
+# bash 4.4 for `inherit_errexit`, namerefs and associative arrays; the
+# packaged script runs under the nixpkgs bash, which satisfies this.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  printf '%s: bash 4.4+ required (found %s.%s)\n' "${0##*/}" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" >&2
+  exit 1
+fi
+
+# The placeholder is replaced with the library's store path when the package is
+# built, so the script never finds its helpers through the environment.
+# shellcheck source=lib/house-rules.bash
+source '@houseRulesLib@'
+
+# Without this, errexit is off inside every $(...) subshell, so a helper called
+# as `n="$(scan ...)"` runs past a failed command and the lint exits 0.
+shopt -s inherit_errexit
+
+readonly LINT='check-workflow-hermetic'
+readonly DEFAULT_WRAPPER='.ci/in-devshell'
+readonly USAGE="usage: ${LINT} [--help]"
+
+# The validators return their error count, so callers test their status and
+# errexit is off inside them. Every helper below therefore checks each command
+# itself and dies on failure, and none runs inside a command substitution,
+# where a die would exit only the subshell.
+
+# @description Print one error in this lint's section of the config file.
+# @arg $1 problem the problem, without the section prefix
+# @stderr `.house-rules.yml: check-workflow-hermetic: <problem>`
+function section_error() {
+  local -r problem="$1"
+  house_rules::config_error "${LINT}: ${problem}"
+}
+
+# @description Cap an error count at the largest exit status, so a count of
+#              256 cannot wrap to success.
+# @arg $1 errors the error count
+# @exitcode * the capped count
+function return_count() {
+  local -r errors="$1"
+  if ((errors > HOUSE_RULES_MAX_STATUS)); then
+    return "${HOUSE_RULES_MAX_STATUS}"
+  fi
+  return "${errors}"
+}
+
+# @description Evaluate a yq expression over the section JSON file and store
+#              the result, as a raw scalar or YAML, in the named variable.
+# @arg $1 result_var name of the variable to set
+# @arg $2 json_file the section JSON
+# @arg $3 expr the yq expression
+function json_query() {
+  local -n result_ref="$1"
+  local -r json_file="$2"
+  local -r expr="$3"
+  yq --input-format=json --output-format=yaml "${expr}" "${json_file}" > "${QUERY_FILE}" \
+    || house_rules::die "yq failed reading ${json_file}"
+  # shellcheck disable=SC2034 # set through the nameref; the caller reads it
+  result_ref="$(< "${QUERY_FILE}")" || house_rules::die "cannot read ${QUERY_FILE}"
+}
+
+# @description Write the unique keys of the map a yq expression selects, one
+#              per line.
+# @arg $1 json_file the section JSON
+# @arg $2 expr the yq expression selecting a map
+# @arg $3 out_file where to write the keys
+function json_keys() {
+  local -r json_file="$1"
+  local -r expr="$2"
+  local -r out_file="$3"
+  yq --input-format=json --output-format=yaml "${expr} | keys | unique | .[]" "${json_file}" > "${out_file}" \
+    || house_rules::die "yq failed reading ${json_file}"
+}
+
+# @description Report every key of a map that is not in the allowed list.
+# @arg $1 keys_file the map's keys, one per line
+# @arg $2 prefix what to put before `unknown key '<k>'`
+# @arg $@ allowed the allowed keys, after the first two arguments
+# @stderr one section error per unknown key
+# @exitcode * the number of unknown keys, capped at 255
+function report_unknown_keys() {
+  local -r keys_file="$1"
+  local -r prefix="$2"
+  shift 2
+  local errors=0 key allowed_key
+  while IFS= read -r key; do
+    for allowed_key in "$@"; do
+      if [[ "${key}" == "${allowed_key}" ]]; then
+        continue 2
+      fi
+    done
+    section_error "${prefix}unknown key '${key}'"
+    errors=$((errors + 1))
+  done < "${keys_file}"
+  return_count "${errors}"
+}
+
+# @description Validate one `exempt` entry and write its step to out_step_file
+#              when the step is well-formed. Duplicates are the caller's check.
+# @arg $1 section_file the section JSON
+# @arg $2 index the entry's zero-based index
+# @arg $3 out_step_file where to write the step; left empty when it is invalid
+# @stderr one section error per problem
+# @exitcode * the number of problems, capped at 255
+function validate_entry() {
+  local -r section_file="$1"
+  local -r index="$2"
+  local -r out_step_file="$3"
+  local -r entry=".exempt[${index}]"
+  local -r where="exempt[${index}]"
+  local errors=0 count=0
+
+  : > "${out_step_file}" || house_rules::die "cannot write ${out_step_file}"
+
+  local entry_type
+  json_query entry_type "${section_file}" "${entry} | type"
+  if [[ "${entry_type}" != '!!map' ]]; then
+    section_error "${where} must be a map"
+    return 1
+  fi
+
+  json_keys "${section_file}" "${entry}" "${out_step_file}"
+  report_unknown_keys "${out_step_file}" "${where}: " 'step' 'reason' || count=$?
+  errors=$((errors + count))
+  : > "${out_step_file}" || house_rules::die "cannot write ${out_step_file}"
+
+  local step_type step='' step_ok=0
+  json_query step_type "${section_file}" "${entry}.step | type"
+  case "${step_type}" in
+    '!!null')
+      section_error "${where}: step is missing"
+      errors=$((errors + 1))
+      ;;
+    '!!str')
+      json_query step "${section_file}" "${entry}.step"
+      # Exactly one `::`: splitting at the first and at the last occurrence
+      # must agree, which also rejects an overlapping `:::`. A newline would
+      # split the one-step-per-line exempt file.
+      local -r file_part="${step%%::*}"
+      local -r id_part="${step#*::}"
+      if [[ "${step}" == *::* && "${file_part}" == "${step%::*}" && -n "${file_part}" && -n "${id_part}" &&
+        "${step}" != *$'\n'* ]]; then
+        step_ok=1
+      else
+        section_error "${where}: step '${step}' is not <file>::<id>"
+        errors=$((errors + 1))
+      fi
+      ;;
+    *)
+      section_error "${where}: step must be a string"
+      errors=$((errors + 1))
+      ;;
+  esac
+
+  local reason_type reason
+  json_query reason_type "${section_file}" "${entry}.reason | type"
+  case "${reason_type}" in
+    '!!null')
+      section_error "${where}: reason is missing or empty"
+      errors=$((errors + 1))
+      ;;
+    '!!str')
+      json_query reason "${section_file}" "${entry}.reason"
+      if [[ -z "${reason//[[:space:]]/}" ]]; then
+        section_error "${where}: reason is missing or empty"
+        errors=$((errors + 1))
+      fi
+      ;;
+    *)
+      section_error "${where}: reason must be a string"
+      errors=$((errors + 1))
+      ;;
+  esac
+
+  if ((step_ok == 1)); then
+    printf '%s\n' "${step}" > "${out_step_file}" || house_rules::die "cannot write ${out_step_file}"
+  fi
+  return_count "${errors}"
+}
+
+# @description Validate this lint's section of `.house-rules.yml`, as written
+#              by house_rules::load_config, and extract its settings.
+# @arg $1 section_json_file the section as JSON; `null` means no section
+# @arg $2 out_exempt_file where to write each valid exempt step, one per line
+# @arg $3 out_wrapper_var name of the variable to set to the wrapper path
+# @stderr one `.house-rules.yml: check-workflow-hermetic: <problem>` line per problem
+# @exitcode 0 the section is valid
+# @exitcode * the number of problems, capped at 255
+function validate_section() {
+  local -r section_json_file="$1"
+  local -r out_exempt_file="$2"
+  local -n wrapper_ref="$3"
+  local -r scratch_file="${TMP_DIR}/section-scratch"
+  local errors=0 count=0
+
+  wrapper_ref="${DEFAULT_WRAPPER}"
+  : > "${out_exempt_file}" || house_rules::die "cannot write ${out_exempt_file}"
+
+  local section_type
+  json_query section_type "${section_json_file}" 'type'
+  case "${section_type}" in
+    '!!null') return 0 ;;
+    '!!map') ;;
+    *)
+      house_rules::config_error "${LINT} must be a map"
+      return 1
+      ;;
+  esac
+
+  json_keys "${section_json_file}" '.' "${scratch_file}"
+  report_unknown_keys "${scratch_file}" '' 'wrapper' 'exempt' || count=$?
+  errors=$((errors + count))
+
+  # A key given with no value is null. It counts as the wrong type, not as
+  # absent, so a half-written setting is reported instead of ignored.
+  local has_wrapper wrapper_type wrapper_value
+  json_query has_wrapper "${section_json_file}" 'has("wrapper")'
+  if [[ "${has_wrapper}" == 'true' ]]; then
+    json_query wrapper_type "${section_json_file}" '.wrapper | type'
+    if [[ "${wrapper_type}" == '!!str' ]]; then
+      json_query wrapper_value "${section_json_file}" '.wrapper'
+      # An empty wrapper would be found in every run body and exempt them all.
+      # TODO: the spec pins no message for an empty wrapper; confirm this one.
+      if [[ -z "${wrapper_value//[[:space:]]/}" ]]; then
+        section_error 'wrapper must not be empty'
+        errors=$((errors + 1))
+      else
+        # shellcheck disable=SC2034 # set through the nameref; the caller reads it
+        wrapper_ref="${wrapper_value}"
+      fi
+    else
+      section_error 'wrapper must be a string'
+      errors=$((errors + 1))
+    fi
+  fi
+
+  local has_exempt exempt_type
+  json_query has_exempt "${section_json_file}" 'has("exempt")'
+  if [[ "${has_exempt}" == 'true' ]]; then
+    json_query exempt_type "${section_json_file}" '.exempt | type'
+    if [[ "${exempt_type}" == '!!seq' ]]; then
+      local entry_count index step
+      local -A seen_steps=()
+      json_query entry_count "${section_json_file}" '.exempt | length'
+      if [[ ! "${entry_count}" =~ ^[0-9]+$ ]]; then
+        house_rules::die "unexpected exempt length '${entry_count}'"
+      fi
+      for ((index = 0; index < entry_count; index++)); do
+        count=0
+        validate_entry "${section_json_file}" "${index}" "${scratch_file}" || count=$?
+        errors=$((errors + count))
+        step="$(< "${scratch_file}")" || house_rules::die "cannot read ${scratch_file}"
+        if [[ -z "${step}" ]]; then
+          continue
+        fi
+        if [[ -n "${seen_steps["${step}"]+set}" ]]; then
+          section_error "exempt[${index}]: duplicate step '${step}'"
+          errors=$((errors + 1))
+          continue
+        fi
+        seen_steps["${step}"]=1
+        printf '%s\n' "${step}" >> "${out_exempt_file}" || house_rules::die "cannot write ${out_exempt_file}"
+      done
+    else
+      section_error 'exempt must be a list'
+      errors=$((errors + 1))
+    fi
+  fi
+
+  return_count "${errors}"
+}
+
+# @description Validate the config, then run the lint.
+# @noargs
+function main() {
+  local repo_root
+  if ! repo_root="$(house_rules::repo_root)"; then
+    exit 1
+  fi
+
+  local -r section_file="${TMP_DIR}/section.json"
+  local -r exempt_file="${TMP_DIR}/exempt"
+  local errors=0 count=0
+  # shellcheck disable=SC2034 # set by validate_section; the workflow scan TODO below reads it
+  local wrapper=''
+
+  house_rules::load_config "${LINT}" "${repo_root}" "${section_file}" || count=$?
+  errors=$((errors + count))
+  count=0
+  validate_section "${section_file}" "${exempt_file}" wrapper || count=$?
+  errors=$((errors + count))
+
+  if ((errors > 0)); then
+    printf '%s %s error(s)\n' "${errors}" "${HOUSE_RULES_CONFIG}" >&2
+    exit 1
+  fi
+  # TODO: the workflow scan reads "${exempt_file}" and "${wrapper}"; until it
+  # lands, a valid config passes.
+}
+
+case "$#" in
+  0) ;;
+  1)
+    case "$1" in
+      --help)
+        printf '%s\n' "${USAGE}"
+        exit 0
+        ;;
+      *) house_rules::die "unexpected argument '$1'; ${USAGE}" ;;
+    esac
+    ;;
+  *) house_rules::die "expected at most one argument, got $#; ${USAGE}" ;;
+esac
+
+# One scratch directory per run, holding every temp file and removed on any
+# exit. Script-level, not local: the single-quoted EXIT trap expands it at
+# exit, after any function's locals are gone.
+TMP_DIR="$(mktemp --directory)"
+readonly TMP_DIR
+trap 'rm --recursive --force -- "${TMP_DIR}"' EXIT
+readonly QUERY_FILE="${TMP_DIR}/query"
+
+main "$@"
