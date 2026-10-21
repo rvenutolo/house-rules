@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+
+# @description Evaluate every package for every darwin system the flake
+#              exports, without building any. CI runs on Linux only, and some
+#              consumers' devShells evaluate on macOS, so a package that fails
+#              to evaluate there would break them while this repo's own gate
+#              stayed green.
+#
+#              The systems are the `-darwin` names among the flake's own
+#              `packages` outputs, so the check follows the `systems` input.
+#              A flake that exports no darwin system fails, and so does an
+#              unreadable export list: a check that evaluated nothing is not a
+#              pass, and a skip path would pass silently if darwin were ever
+#              dropped. Likewise a system with no packages fails.
+#
+#              Reading `drvPath` forces the evaluation of the derivation and
+#              nothing more; it does not build. The package names come from
+#              the flake too, so a new lint is covered without an edit here.
+#
+#              Failures aggregate, so one run names every package that does
+#              not evaluate. Must run inside the devShell (nix, yq).
+# @noargs
+# @stderr progress as timestamped log lines; findings as plain lines,
+#         `check-darwin-eval: <system>.<name> does not evaluate`
+# @exitcode 0 every package evaluates on every exported darwin system.
+# @exitcode 1 a package does not evaluate, a system has no packages, a list
+#             cannot be read, no darwin system is exported, or an argument was
+#             given.
+
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+trap 'printf "[%s] ERROR: line %s (exit %s): %s\n" "${0##*/}" "${LINENO}" "$?" "${BASH_COMMAND}" >&2' ERR
+
+# bash 4.4 for `inherit_errexit` and `mapfile`; the devShell's bash satisfies it.
+if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4))); then
+  printf '%s: bash 4.4+ required (found %s.%s)\n' "${0##*/}" "${BASH_VERSINFO[0]}" "${BASH_VERSINFO[1]}" >&2
+  exit 1
+fi
+shopt -s inherit_errexit
+
+readonly NAME='check-darwin-eval'
+
+# One scratch directory for every temp file. A script-level variable, not a
+# local: the single-quoted EXIT trap expands it at exit, after any function's
+# locals are gone.
+TMP_DIR="$(mktemp --directory)"
+readonly TMP_DIR
+trap 'rm --recursive --force -- "${TMP_DIR}"' EXIT
+
+# @description Write a timestamped, levelled line to stderr.
+# @arg $1 level severity label
+# @arg $2 message text to print
+function log() {
+  local -r level="$1"
+  local -r message="$2"
+  printf '[%s] %-5s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${level}" "${message}" >&2
+}
+
+# @description Write an INFO line to stderr.
+# @arg $@ message text to print
+function log_info() {
+  log INFO "$*"
+}
+
+# @description Print one finding as a plain line on stderr. Findings are the
+#              check's report output, not log lines.
+# @arg $1 problem what is wrong
+# @stderr `check-darwin-eval: <problem>`
+function report() {
+  local -r problem="$1"
+  printf '%s: %s\n' "${NAME}" "${problem}" >&2
+}
+
+# @description Print nix's captured stderr, indented, under a finding.
+# @arg $1 err_file file holding nix's stderr
+function show_nix_error() {
+  local -r err_file="$1"
+  if [[ -s "${err_file}" ]]; then
+    sed 's/^/  /' "${err_file}" >&2
+  fi
+}
+
+# @description Write the darwin systems the flake exports to a file, one per
+#              line.
+# @arg $1 out_file where to write the systems
+# @exitcode 0 the list was read, however many systems it holds.
+# @exitcode 1 the export list cannot be read.
+function list_darwin_systems() {
+  local -r out_file="$1"
+  local -r json_file="${TMP_DIR}/systems.json"
+  local -r err_file="${TMP_DIR}/systems.err"
+  if ! nix eval --json "${REPO_DIR}#packages" --apply builtins.attrNames > "${json_file}" 2> "${err_file}"; then
+    report 'cannot list the systems the flake exports'
+    show_nix_error "${err_file}"
+    return 1
+  fi
+  yq --input-format json --output-format yaml '.[] | select(test("-darwin$"))' "${json_file}" > "${out_file}"
+}
+
+# @description Evaluate every package of one system.
+# @arg $1 system the darwin system
+# @exitcode 0 every package evaluates.
+# @exitcode 1 a package fails, the system has no packages, or the list cannot
+#             be read.
+function check_system() {
+  local -r system="$1"
+  local -r names_file="${TMP_DIR}/${system}.names"
+  local -r err_file="${TMP_DIR}/${system}.err"
+  local status=0
+
+  if ! nix eval --json "${REPO_DIR}#packages.${system}" --apply builtins.attrNames \
+    > "${TMP_DIR}/${system}.json" 2> "${err_file}"; then
+    report "cannot list packages for ${system}"
+    show_nix_error "${err_file}"
+    return 1
+  fi
+  yq --input-format json --output-format yaml '.[]' "${TMP_DIR}/${system}.json" > "${names_file}"
+
+  local -a names=()
+  mapfile -t names < "${names_file}"
+  if ((${#names[@]} == 0)); then
+    report "no packages defined for ${system}"
+    return 1
+  fi
+
+  local name
+  for name in "${names[@]}"; do
+    log_info "evaluating ${system}.${name}"
+    if ! nix eval --raw "${REPO_DIR}#packages.${system}.${name}.drvPath" > '/dev/null' 2> "${err_file}"; then
+      report "${system}.${name} does not evaluate"
+      show_nix_error "${err_file}"
+      status=1
+    fi
+  done
+  return "${status}"
+}
+
+# @description Check every exported darwin system and aggregate the exit codes.
+# @noargs
+function main() {
+  local rc=0
+  local -r systems_file="${TMP_DIR}/systems"
+  local -a systems=()
+  if list_darwin_systems "${systems_file}"; then
+    mapfile -t systems < "${systems_file}"
+    if ((${#systems[@]} == 0)); then
+      report 'the flake exports no darwin system'
+      rc=1
+    fi
+  else
+    rc=1
+  fi
+  local system
+  for system in "${systems[@]}"; do
+    check_system "${system}" || rc=1
+  done
+  # A check reporting its own verdict is not a crash: drop the ERR trap so the
+  # findings above are the last thing the reader sees.
+  trap - ERR
+  return "${rc}"
+}
+
+if (($# > 0)); then
+  printf '%s: expected no arguments, got %s\n' "${NAME}" "$#" >&2
+  exit 1
+fi
+REPO_DIR="$(git rev-parse --show-toplevel)"
+readonly REPO_DIR
+cd "${REPO_DIR}" || exit 1
+
+main "$@"

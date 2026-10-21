@@ -36,6 +36,8 @@
         "run-all-checks"
         "run-tests"
       ];
+      # `lints/*` also matches each lint's package.nix, which is nixfmt's.
+      excludes = [ "*.nix" ];
     };
     shfmt-bats = {
       command = "${pkgs.shfmt}/bin/shfmt";

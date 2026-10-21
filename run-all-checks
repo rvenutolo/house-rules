@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 
 # @description The full verification gate, verify-only: formatting (nix flake
-#              check), the lint suite and the BATS suite. Exit codes aggregate,
-#              so one run surfaces every failing category. Every caller (the
-#              pre-push hook, the .justfile and CI) runs it through
-#              .ci/in-devshell, so local and CI runs cannot drift.
+#              check), the darwin evaluation check, the lint suite and the
+#              BATS suite. Exit codes aggregate, so one run surfaces every
+#              failing category. Every caller (the pre-push hook, the
+#              .justfile and CI) runs it through .ci/in-devshell, so local
+#              and CI runs cannot drift.
 # @noargs
 # @exitcode 0 every check passed.
 # @exitcode 1 one or more checks failed.
@@ -79,6 +80,9 @@ function main() {
 
   log_info 'running nix flake check (formatting)'
   nix flake check --no-eval-cache "${REPO_DIR}" || rc=1
+
+  log_info 'running darwin evaluation check'
+  "${REPO_DIR}/.ci/check-darwin-eval" || rc=1
 
   log_info 'running lint checks'
   "${REPO_DIR}/.ci/run-lint-checks" || rc=1

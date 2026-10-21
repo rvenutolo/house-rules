@@ -43,6 +43,10 @@
     {
       formatter = eachSystem (pkgs: treefmtEval.${pkgs.stdenv.hostPlatform.system}.config.build.wrapper);
 
+      packages = eachSystem (pkgs: {
+        check-workflow-hermetic = pkgs.callPackage ./lints/check-workflow-hermetic/package.nix { };
+      });
+
       checks = eachSystem (pkgs: {
         formatting = treefmtEval.${pkgs.stdenv.hostPlatform.system}.config.build.check self;
       });
@@ -74,6 +78,9 @@
             coreutils
             findutils
             gnugrep
+            # The lints under test, as the flake builds them: the tests run
+            # the packaged binary, so they cover its bundling and PATH too.
+            self.packages.${pkgs.stdenv.hostPlatform.system}.check-workflow-hermetic
             # withLibraries, not bare bats: the wrapper exports BATS_LIB_PATH
             # at its own share/bats, so test_helper/common.bash loads the
             # libraries with `bats_load_library`, and a bats that is not this
