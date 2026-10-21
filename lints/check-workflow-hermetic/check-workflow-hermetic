@@ -73,13 +73,15 @@ readonly SCAN_ROOTS=('.github/workflows' '.github/actions')
 # The forbidden direct-entry spelling is assembled from two words, and matched
 # as a regex with a class where its space would be, so this source never
 # contains the string it forbids: the user's repos scan their trees for it. The
-# class also tolerates runs of whitespace, newlines included. The outer classes
-# are word boundaries, so `in-devshell` and `nix-installer-action` do not
-# match. The pattern is valid both as a grep ERE and as a Go regexp for yq.
+# class also tolerates runs of whitespace, newlines included, and a backslash
+# before whitespace, so a shell line continuation counts as a space. The outer
+# classes are word boundaries, so `in-devshell` and `nix-installer-action` do
+# not match. The pattern is valid both as a grep ERE and as a Go regexp for yq.
 readonly NIX_WORD='nix'
 readonly DEVELOP_WORD='develop'
 readonly FORBIDDEN_SPELLING="${NIX_WORD} ${DEVELOP_WORD}"
-readonly FORBIDDEN_PATTERN="(^|[^[:alnum:]_-])${NIX_WORD}[[:space:]]+${DEVELOP_WORD}([^[:alnum:]_-]|\$)"
+readonly FORBIDDEN_GAP='([[:space:]]|\\[[:space:]])+'
+readonly FORBIDDEN_PATTERN="(^|[^[:alnum:]_-])${NIX_WORD}${FORBIDDEN_GAP}${DEVELOP_WORD}([^[:alnum:]_-]|\$)"
 
 # yq expression counting, per document, the scalar values whose decoded text
 # matches HOUSE_RULES_FORBIDDEN_PATTERN. The raw-text grep misses a spelling
