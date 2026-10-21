@@ -27,7 +27,7 @@ Each lint is a flake package named after the lint. There is no `default` package
    house-rules.packages.${system}.check-workflow-hermetic
    ```
 
-3. Add `check-workflow-hermetic` to the repo's `.ci/required-tools`.
+3. If the repo keeps a `.ci/required-tools` list, add `check-workflow-hermetic` there.
 4. Call `check-workflow-hermetic` from the repo's gate, inside the devShell, so the pre-push hook, the `just` recipes
    and CI all run it.
 5. Optionally add a `.house-rules.yml` at the repo root (see below).
@@ -61,8 +61,9 @@ check-workflow-hermetic:
 ```
 
 - `wrapper`: optional string, the repo-relative path a compliant `run:` body must name. Default `.ci/in-devshell`. It
-  must be a single line and not blank.
-- `exempt`: optional list of entries, each with exactly two keys:
+  must be a single line and not blank. A bare `wrapper:` with no value is an error, not the default.
+- `exempt`: optional list of entries; a bare `exempt:` with no value is an error, not an empty list. Each entry has
+  exactly two keys:
   - `step`: `<repo-relative-file>::<step-id>`, a single-line string with exactly one `::` and a non-blank file part and
     id part. The id is the step's YAML `id:`.
   - `reason`: a non-blank string saying why the step cannot use the wrapper.
@@ -79,9 +80,10 @@ File level:
 - `holds <N> YAML documents; expected one`
 - merge keys, aliases and tags other than the core tags (`!!map`, `!!seq`, `!!str`, `!!null`, `!!int`, `!!bool`,
   `!!float`), anywhere in the file: `merge key '<<' is not supported (in <where>)`,
-  `YAML alias '*<name>' is not supported (in <where>)` and `YAML tag '<tag>' is not supported (in <where>)`. Any of
-  these would change what a later read sees, such as adding a key or overriding `step` unseen. They are reported
-  alone: the checks below do not run while one is present.
+  `YAML alias '*<name>' is not supported (in <where>)` and
+  `YAML tag '<tag>' is not supported (in <where>); quote the value or drop the tag`. Any of these would change what a
+  later read sees, such as adding a key or overriding `step` unseen. They are reported alone: the checks below do not
+  run while one is present.
 - `top level must be a map`
 - `unknown lint '<key>'; known: <names>` for a top-level key that is not a lint name
 - `duplicate key '<key>' in <where>` for a mapping key repeated at the top level or anywhere inside the lint's section
@@ -127,8 +129,10 @@ symlinks. It exits 0 when the config is valid and nothing is found, and 1 otherw
   (the same id in two jobs, or in two YAML documents) exempts none of them. Give each exempted step a unique id.
 - **Unparsable workflow files** are violations: `<file>: not valid YAML`. They do not stop the scan of other files. A
   duplicate mapping key in a scanned file is reported as `<file>: not valid YAML: duplicate key '<key>' in <where>`.
-- **Non-core YAML tags** in a scanned file are violations: `<file>: YAML tag '<tag>' is not supported (in <where>)`. A
-  custom tag changes what a node means to each parser that reads it.
+- **Non-core YAML tags** in a scanned file are violations:
+  `<file>: YAML tag '<tag>' is not supported (in <where>); quote the value or drop the tag`. A custom tag changes what a
+  node means to each parser that reads it. An unquoted date such as `RELEASE_DATE: 2024-01-01` carries the
+  `!!timestamp` tag, so quote it.
 - **A scan root that exists but is not a directory** (for example `.github/workflows` as a regular file, or a symlink
   to one) is a violation: `<root>: not a directory`. A missing root is fine.
 - **Aliases and merge keys** in scanned files are resolved: a `run:` key reached through either is scanned, and a
